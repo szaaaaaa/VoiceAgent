@@ -1,0 +1,59 @@
+# VoiceAgent Default Runtime Configuration
+
+server:
+  host: "127.0.0.1"
+  port: 8765
+  max_audio_queue_ms: 5000
+
+audio:
+  input_sample_rate: 16000
+  output_sample_rate: 24000
+  channels: 1
+  frame_duration_ms: 20
+  preroll_buffer_ms: 300
+  ring_buffer_seconds: 30
+  aec_enabled: true
+  noise_suppression_enabled: true
+
+vad:
+  provider: "silero"
+  threshold_start: 0.50
+  threshold_end: 0.35
+  min_speech_duration_ms: 120
+  min_silence_duration_ms: 200
+
+asr:
+  provider: "nemotron"
+  model_id: "nvidia/nemotron-speech-streaming-en-0.6b"
+  precision: "bf16"
+  chunk_size_ms: 80
+  extract_encoder_features: true
+  checkpoint_path: null
+
+turn_manager:
+  strategy: "hybrid" # fixed_silence | vad_only | smart_turn | adapter | hybrid
+  adapter_checkpoint: null
+  eot_probability_threshold: 0.72
+  interruption_probability_threshold: 0.68
+  backchannel_max_duration_ms: 600
+  conservative_silence_timeout_ms: 1100
+  speculative_generation_enabled: false
+
+tts:
+  provider: "qwen3_tts"
+  model_id: "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+  precision: "bf16"
+  streaming: true
+  sentence_min_chars: 12
+  speaker_profile: "default"
+  checkpoint_path: null
+
+agent:
+  runtime: "pi-sdk"
+  default_mode: "conversation" # conversation | action
+  default_permission_level: "ask" # readonly | ask | trusted
+  approval_timeout_ms: 15000
+
+resources:
+  target_vram_limit_gb: 8.0
+  fallback_to_text_on_oom: true

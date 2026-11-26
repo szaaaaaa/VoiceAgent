@@ -1,0 +1,57 @@
+[project]
+name = "voice-agent-backend"
+version = "0.1.0"
+description = "Local speech inference, causal turn-taking training, and evaluation backend for VoiceAgent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "websockets>=14.0",
+    "pydantic>=2.10.0",
+    "pyyaml>=6.0.2",
+    "numpy>=1.26.0",
+    "soundfile>=0.13.0",
+]
+
+[project.optional-dependencies]
+inference = [
+    "torch>=2.6.0",
+    "torchaudio>=2.6.0",
+    "silero-vad>=5.1.2",
+    "transformers>=4.49.0",
+    "accelerate>=1.4.0",
+]
+asr = [
+    "nemo_toolkit[asr]>=2.1.0",
+]
+training = [
+    "datasets>=3.3.0",
+    "peft>=0.14.0",
+    "tensorboard>=2.18.0",
+    "wandb>=0.19.0",
+]
+eval = [
+    "jiwer>=3.1.0",
+    "scipy>=1.15.0",
+    "scikit-learn>=1.6.0",
+    "pandas>=2.2.0",
+]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.25.0",
+    "ruff>=0.9.0",
+    "mypy>=1.15.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "evaluation"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

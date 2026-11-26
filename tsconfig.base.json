@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": false,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "baseUrl": ".",
+    "paths": {
+      "@voice-agent/audio": ["packages/audio/index.ts"],
+      "@voice-agent/speech": ["packages/speech/index.ts"],
+      "@voice-agent/interaction": ["packages/interaction/index.ts"],
+      "@voice-agent/agent": ["packages/agent/index.ts"],
+      "@voice-agent/protocol": ["packages/protocol/index.ts"],
+      "@voice-agent/metrics": ["packages/metrics/index.ts"]
+    }
+  }
+}

@@ -1,0 +1,63 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# TypeScript & Electron build outputs
+dist/
+out/
+build/
+release/
+.vite/
+*.tsbuildinfo
+
+# Python virtual environments & caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Model weights & checkpoints (keep README/.gitkeep only)
+models/*
+!models/README.md
+!models/.gitkeep
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.nemo
+*.bin
+
+# Datasets, recordings & experiment artifacts (keep README/.gitkeep only)
+data/*
+!data/README.md
+!data/.gitkeep
+*.wav
+*.flac
+*.mp3
+*.pcm
+*.ogg
+wandb/
+runs/
+outputs/
+experiments/logs/
+
+# Environment & secrets (never commit API keys)
+.env
+.env.*
+!.env.example
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.log
