@@ -15,7 +15,8 @@
   "scripts": {
     "dev": "vite --config apps/desktop/vite.config.ts",
     "gui": "vite --config apps/desktop/vite.config.ts",
-    "desktop": "electron apps/desktop/electron-main.cjs",
+    "desktop": "npm run build:gui && electron apps/desktop/electron-main.cjs",
+    "desktop:gpu": "powershell -ExecutionPolicy Bypass -File ./Start-VoiceAgent.ps1 -GpuModels",
     "build:gui": "vite build --config apps/desktop/vite.config.ts",
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",

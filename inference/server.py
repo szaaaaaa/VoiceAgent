@@ -10,10 +10,12 @@ import asyncio
 import json
 import os
 import shutil
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from inference.protocol import (
@@ -35,8 +37,51 @@ class AgentTurnRequest(BaseModel):
     permission_level: str = "ask"
 
 
+class ApprovalDecisionRequest(BaseModel):
+    approval_id: str
+    approved: bool
+    source: str = "ui"
+    reason: str = ""
+
+
+_HIGH_RISK_KEYWORDS = (
+    "delete ",
+    "remove ",
+    "rm ",
+    "format ",
+    "shutdown",
+    "删除",
+    "清空",
+    "执行命令",
+    "写文件",
+    "修改文件",
+)
+
+
+def _needs_explicit_approval(req: AgentTurnRequest) -> dict[str, Any] | None:
+    lowered = req.user_text.lower()
+    if any(k in lowered for k in _HIGH_RISK_KEYWORDS):
+        if req.agent_mode == "conversation" or req.permission_level != "trusted":
+            return {
+                "approvalId": f"appr_{req.turn_id}",
+                "toolName": "workspace.action",
+                "impactSummary": f"Requested potentially side-effecting action: {req.user_text[:120]}",
+                "targetPath": None,
+                "command": req.user_text[:120],
+            }
+    return None
+
+
 async def _run_pi_turn(req: AgentTurnRequest) -> dict[str, Any]:
     """Bridges live GUI turns to the locally installed `pi` CLI with low-latency --thinking off."""
+    pending = _needs_explicit_approval(req)
+    if pending is not None:
+        return {
+            "reply": "This action may modify local files or system state. Please confirm in the approval dialog or say confirm.",
+            "tool_calls": [],
+            "pending_approval": pending,
+        }
+
     launcher = os.path.join(os.path.expanduser("~"), ".pi", "agent", "bin", "pi-launcher.js")
     node_exe = shutil.which("node")
     pi_exe = shutil.which("pi")
@@ -112,11 +157,13 @@ def create_app(manager: InferenceRuntimeManager | None = None) -> FastAPI:
     app = FastAPI(title="VoiceAgent Local Inference Server", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+        allow_origins=["http://127.0.0.1:5173", "http://localhost:5173", "null"],
+        allow_origin_regex=r"^(file://.*|http://127\.0\.0\.1:\d+|http://localhost:\d+)$",
         allow_methods=["*"],
         allow_headers=["*"],
     )
     app.state.runtime = runtime
+    pending_approvals: dict[str, AgentTurnRequest] = {}
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -132,7 +179,34 @@ def create_app(manager: InferenceRuntimeManager | None = None) -> FastAPI:
 
     @app.post("/api/agent/turn")
     async def api_agent_turn(req: AgentTurnRequest) -> dict[str, Any]:
-        return await _run_pi_turn(req)
+        res = await _run_pi_turn(req)
+        if res.get("pending_approval"):
+            appr_id = str(res["pending_approval"]["approvalId"])
+            pending_approvals[appr_id] = req
+        return res
+
+    @app.post("/api/agent/approval")
+    async def api_agent_approval(decision: ApprovalDecisionRequest) -> dict[str, Any]:
+        original = pending_approvals.pop(decision.approval_id, None)
+        if not decision.approved:
+            return {
+                "reply": f"Action cancelled ({decision.reason or 'denied by user'}).",
+                "tool_calls": [
+                    {
+                        "id": decision.approval_id,
+                        "name": "workspace.action",
+                        "status": "denied",
+                        "output": decision.reason or "Denied by user",
+                    }
+                ],
+            }
+        if original is None:
+            return {"reply": "Approval request expired or not found.", "tool_calls": []}
+        # Re-dispatch approved request in trusted action scope.
+        approved_req = original.model_copy(
+            update={"agent_mode": "action", "permission_level": "trusted"}
+        )
+        return await _run_pi_turn(approved_req)
 
     @app.websocket("/ws/v1/voice")
     async def voice_ws(ws: WebSocket) -> None:
@@ -405,6 +479,11 @@ def create_app(manager: InferenceRuntimeManager | None = None) -> FastAPI:
         finally:
             tts_worker_task.cancel()
             runtime.reset_session(session_id)
+
+    # Serve built desktop renderer directly on 127.0.0.1 so Electron loads via secure same-origin HTTP.
+    renderer_dist = Path(__file__).resolve().parent.parent / "apps" / "desktop" / "dist" / "renderer"
+    if renderer_dist.is_dir():
+        app.mount("/", StaticFiles(directory=str(renderer_dist), html=True), name="desktop_ui")
 
     return app
 

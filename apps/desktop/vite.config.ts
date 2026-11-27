@@ -5,6 +5,7 @@ import react from "@vitejs/plugin-react";
 const rootDir = path.resolve(__dirname, "../..");
 
 export default defineConfig({
+  base: "./",
   root: path.resolve(__dirname, "renderer"),
   plugins: [react()],
   resolve: {

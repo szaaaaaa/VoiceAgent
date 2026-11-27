@@ -8,6 +8,7 @@ out/
 build/
 release/
 .vite/
+.electron-userdata/
 *.tsbuildinfo
 
 # Python virtual environments & caches
