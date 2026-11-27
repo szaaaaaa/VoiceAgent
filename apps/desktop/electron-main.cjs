@@ -130,7 +130,9 @@ function createWindow() {
     });
   }
 
-  mainWin.loadURL(targetUrl);
+  mainWin.loadURL(targetUrl, {
+    extraHeaders: "pragma: no-cache\nCache-Control: no-cache, no-store, must-revalidate\n",
+  });
 
   mainWin.on("closed", () => {
     mainWin = null;
@@ -178,6 +180,7 @@ app.whenReady().then(async () => {
   });
 
   registerIpc();
+  await session.defaultSession.clearCache();
   await startBackend(heavyModelsEnabled);
   createWindow();
 

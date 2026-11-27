@@ -34,7 +34,7 @@ asr:
 
 turn_manager:
   strategy: "hybrid" # fixed_silence | vad_only | smart_turn | adapter | hybrid
-  adapter_checkpoint: null
+  adapter_checkpoint: "models/turn_adapter/causal_gru_best.pt"
   eot_probability_threshold: 0.72
   interruption_probability_threshold: 0.68
   backchannel_max_duration_ms: 600
