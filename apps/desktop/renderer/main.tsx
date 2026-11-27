@@ -66,6 +66,23 @@ const DEFAULT_API_BASE = "http://127.0.0.1:8765";
 const EXPLICIT_APPROVE = new Set(["yes", "approve", "confirm", "allow", "同意", "确认", "允许", "批准"]);
 const EXPLICIT_DENY = new Set(["no", "deny", "cancel", "stop", "不要", "拒绝", "取消"]);
 
+const MODE_LABELS: Record<InteractionMode, string> = {
+  "hands-free": "免提连续对话",
+  "push-to-talk": "按键说话",
+  text: "纯文本",
+  mute: "静音",
+};
+
+const ASSISTANT_STATE_LABELS: Record<string, string> = {
+  idle: "空闲",
+  thinking: "思考中",
+  executing: "执行工具中",
+  speaking: "播报中",
+  interrupted: "已被打断",
+  awaiting_approval: "等待授权",
+  error: "异常",
+};
+
 function VoiceAgentDesktop(): React.ReactElement {
   const [wsUrl, setWsUrl] = useState(DEFAULT_WS_URL);
   const [apiBase, setApiBase] = useState(DEFAULT_API_BASE);
@@ -114,6 +131,7 @@ function VoiceAgentDesktop(): React.ReactElement {
   const partialTextRef = useRef(partialText);
   const pendingApprovalRef = useRef<PendingApprovalUi | null>(pendingApproval);
   const ttsEngineRef = useRef<TtsEngineChoice>(ttsEngine);
+  const zhVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const eventLogRef = useRef<Array<Record<string, unknown>>>([]);
 
@@ -127,6 +145,24 @@ function VoiceAgentDesktop(): React.ReactElement {
     eventLogRef.current.push({ ts: Date.now(), kind, ...data });
     if (eventLogRef.current.length > 500) eventLogRef.current.shift();
   };
+
+  // Preload Windows Chinese TTS voice (e.g. Microsoft Huihui / Xiaoxiao) as soon as voices load.
+  useEffect(() => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    const pickZhVoice = () => {
+      const voices = window.speechSynthesis.getVoices();
+      zhVoiceRef.current =
+        voices.find((v) => /xiaoxiao|yunxi|yaoyao|huihui/i.test(v.name) && v.lang.toLowerCase().startsWith("zh")) ??
+        voices.find((v) => v.lang.toLowerCase().startsWith("zh-cn")) ??
+        voices.find((v) => v.lang.toLowerCase().startsWith("zh")) ??
+        null;
+    };
+    pickZhVoice();
+    window.speechSynthesis.onvoiceschanged = pickZhVoice;
+    return () => {
+      window.speechSynthesis.onvoiceschanged = null;
+    };
+  }, []);
 
   // Sync Electron desktop config & global Alt+Space PTT shortcut when running in Electron.
   useEffect(() => {
@@ -190,18 +226,19 @@ function VoiceAgentDesktop(): React.ReactElement {
     const utter = new SpeechSynthesisUtterance(text);
     utter.lang = "zh-CN";
     utter.rate = 1.05;
-    const voices = window.speechSynthesis.getVoices();
-    const zhVoice =
-      voices.find((v) => /xiaoxiao|yunxi|yaoyao|huihui/i.test(v.name) && v.lang.toLowerCase().startsWith("zh")) ??
-      voices.find((v) => v.lang.toLowerCase().startsWith("zh-cn")) ??
-      voices.find((v) => v.lang.toLowerCase().startsWith("zh"));
-    if (zhVoice) utter.voice = zhVoice;
+    if (zhVoiceRef.current) {
+      utter.voice = zhVoiceRef.current;
+    } else {
+      const voices = window.speechSynthesis.getVoices();
+      const zh = voices.find((v) => v.lang.toLowerCase().startsWith("zh"));
+      if (zh) utter.voice = zh;
+    }
     utter.onstart = () => {
       setAssistantState("speaking");
       if (speechEndRef.current > 0) {
         const e2e = Math.round(performance.now() - speechEndRef.current);
         setLastLatencyMs((prev) => ({ ...prev, ttfa: e2e, e2e }));
-        pushLog("e2e_audible", { turnId, e2eMs: e2e, engine: "native_voice" });
+        pushLog("e2e_audible", { turnId, e2eMs: e2e, engine: "native_voice_zh" });
         speechEndRef.current = 0;
       }
     };
@@ -328,7 +365,7 @@ function VoiceAgentDesktop(): React.ReactElement {
         }
         dispatchSpeakableReply(turnId, generationId, generationTag, data.reply);
       } catch (err) {
-        setStatusNote(`Approval dispatch error: ${err instanceof Error ? err.message : String(err)}`);
+        setStatusNote(`审批请求异常：${err instanceof Error ? err.message : String(err)}`);
         setAssistantState("error");
       }
     },
@@ -340,15 +377,14 @@ function VoiceAgentDesktop(): React.ReactElement {
       const clean = userText.trim();
       if (!clean) return;
 
-      // If an approval modal is waiting, interpret spoken/typed reply fail-closed.
       if (pendingApprovalRef.current) {
         const norm = clean.toLowerCase().replace(/[.,!?;:。！？]+$/g, "");
         if (EXPLICIT_APPROVE.has(norm)) {
-          await respondApproval(true, "voice", `Explicit approval: "${clean}"`);
+          await respondApproval(true, "voice", `语音明确确认：「${clean}」`);
         } else if (EXPLICIT_DENY.has(norm)) {
-          await respondApproval(false, "voice", `Explicit denial: "${clean}"`);
+          await respondApproval(false, "voice", `语音明确拒绝：「${clean}」`);
         } else {
-          await respondApproval(false, "voice", `Ambiguous response "${clean}" treated as denied`);
+          await respondApproval(false, "voice", `语义不明确「${clean}」，默认拒绝`);
         }
         return;
       }
@@ -396,7 +432,7 @@ function VoiceAgentDesktop(): React.ReactElement {
         }
         dispatchSpeakableReply(turnId, generationId, generationTag, data.reply);
       } catch (err) {
-        setStatusNote(`Agent error: ${err instanceof Error ? err.message : String(err)}`);
+        setStatusNote(`智能体请求异常：${err instanceof Error ? err.message : String(err)}`);
         setAssistantState("error");
       }
     },
@@ -605,14 +641,14 @@ function VoiceAgentDesktop(): React.ReactElement {
       setDevices(await listAudioDevices());
       setStatusNote(null);
     } catch (err) {
-      setStatusNote(`Microphone error: ${err instanceof Error ? err.message : String(err)}`);
+      setStatusNote(`麦克风启动失败：${err instanceof Error ? err.message : String(err)}`);
     }
   };
 
   const handleToggleHeavyGpu = async (): Promise<void> => {
     const bridge = window.voiceAgentDesktop;
     if (!bridge) {
-      setStatusNote("Launch via Electron (`npm run desktop`) to hot-restart backend with GPU models.");
+      setStatusNote("请从桌面图标启动 Electron 应用以支持应用内热切换 GPU 模型。");
       return;
     }
     setRestartingBackend(true);
@@ -621,7 +657,11 @@ function VoiceAgentDesktop(): React.ReactElement {
     setHeavyGpu(res.heavyModelsEnabled);
     setTtsEngine(res.heavyModelsEnabled ? "backend_pcm" : "native_voice");
     setRestartingBackend(false);
-    setStatusNote(res.ok ? `Backend restarted (${res.heavyModelsEnabled ? "Full CUDA Models" : "Fast Mode"})` : "Backend restart failed");
+    setStatusNote(
+      res.ok
+        ? `推理服务已重启（${res.heavyModelsEnabled ? "完整 RTX 5070 中文大模型" : "极速轻量模式"}）`
+        : "推理服务重启失败",
+    );
   };
 
   const handleExportLogs = async (): Promise<void> => {
@@ -629,7 +669,7 @@ function VoiceAgentDesktop(): React.ReactElement {
     const bridge = window.voiceAgentDesktop;
     if (bridge) {
       const res = await bridge.exportLogs(jsonl);
-      if (res.saved && res.path) setStatusNote(`Logs exported to ${res.path}`);
+      if (res.saved && res.path) setStatusNote(`实验日志已导出至：${res.path}`);
       return;
     }
     const blob = new Blob([jsonl], { type: "application/x-ndjson" });
@@ -650,35 +690,35 @@ function VoiceAgentDesktop(): React.ReactElement {
           <span style={{ width: 10, height: 10, borderRadius: "50%", background: connected ? "#22c55e" : "#ef4444", display: "inline-block" }} />
           <strong style={{ fontSize: 18 }}>VoiceAgent</strong>
           <span style={{ fontSize: 11, padding: "2px 7px", borderRadius: 999, background: "#1e293b", color: "#93c5fd" }}>
-            {isElectron ? "Desktop App" : "Web Preview"}
+            {isElectron ? "桌面版" : "网页预览"}
           </span>
         </div>
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", fontSize: 12 }}>
           <select
-            aria-label="Microphone"
+            aria-label="麦克风设备"
             value={selectedMic}
             onChange={(e) => setSelectedMic(e.target.value)}
             style={{ background: "#111827", border: "1px solid #374151", borderRadius: 6, padding: "5px 8px" }}
           >
-            <option value="default">Default Mic</option>
+            <option value="default">默认麦克风</option>
             {devices.filter((d) => d.kind === "audioinput").map((d) => (
               <option key={d.deviceId} value={d.deviceId}>{d.label}</option>
             ))}
           </select>
 
           <select
-            aria-label="TTS Engine"
+            aria-label="播报语音引擎"
             value={ttsEngine}
             onChange={(e) => setTtsEngine(e.target.value as TtsEngineChoice)}
             style={{ background: "#111827", border: "1px solid #374151", borderRadius: 6, padding: "5px 8px" }}
           >
-            <option value="native_voice">Voice: Windows Neural (Instant)</option>
-            <option value="backend_pcm">Voice: Backend PCM (Qwen3-TTS)</option>
+            <option value="native_voice">语音：Windows 中文即时播报</option>
+            <option value="backend_pcm">语音：本地 Qwen3-TTS (中文)</option>
           </select>
 
           <select
-            aria-label="Turn Strategy"
+            aria-label="轮次预测策略"
             value={turnStrategy}
             onChange={(e) => {
               const s = e.target.value as TurnStrategy;
@@ -687,31 +727,31 @@ function VoiceAgentDesktop(): React.ReactElement {
             }}
             style={{ background: "#111827", border: "1px solid #374151", borderRadius: 6, padding: "5px 8px" }}
           >
-            <option value="hybrid">Turn: Hybrid (GRU+Rules)</option>
-            <option value="adapter">Turn: Causal GRU</option>
-            <option value="smart_turn">Turn: Smart Turn</option>
-            <option value="fixed_silence">Turn: Fixed Silence</option>
+            <option value="hybrid">轮次：混合策略 (GRU+规则)</option>
+            <option value="adapter">轮次：Causal GRU 模型</option>
+            <option value="smart_turn">轮次：Smart Turn 基线</option>
+            <option value="fixed_silence">轮次：固定静音阈值</option>
           </select>
 
           <select
-            aria-label="Agent Mode"
+            aria-label="运行模式"
             value={agentMode}
             onChange={(e) => setAgentMode(e.target.value as "conversation" | "action")}
             style={{ background: "#111827", border: "1px solid #374151", borderRadius: 6, padding: "5px 8px" }}
           >
-            <option value="conversation">Mode: Conversation</option>
-            <option value="action">Mode: Action</option>
+            <option value="conversation">模式：普通对话</option>
+            <option value="action">模式：执行操作</option>
           </select>
 
           <select
-            aria-label="Permission Policy"
+            aria-label="权限级别"
             value={permLevel}
             onChange={(e) => setPermLevel(e.target.value as "readonly" | "ask" | "trusted")}
             style={{ background: "#111827", border: "1px solid #374151", borderRadius: 6, padding: "5px 8px" }}
           >
-            <option value="readonly">Policy: Readonly</option>
-            <option value="ask">Policy: Ask</option>
-            <option value="trusted">Policy: Trusted</option>
+            <option value="readonly">权限：只读</option>
+            <option value="ask">权限：执行前询问</option>
+            <option value="trusted">权限：信任白名单</option>
           </select>
 
           <button
@@ -720,7 +760,7 @@ function VoiceAgentDesktop(): React.ReactElement {
             onClick={() => void handleToggleHeavyGpu()}
             style={{ background: heavyGpu ? "#059669" : "#374151", border: "none", borderRadius: 6, padding: "5px 10px", cursor: "pointer" }}
           >
-            {restartingBackend ? "Restarting..." : heavyGpu ? "GPU Models: ON" : "GPU Models: Fast"}
+            {restartingBackend ? "重启中..." : heavyGpu ? "GPU 大模型：已开启" : "GPU 大模型：极速模式"}
           </button>
 
           <button
@@ -728,7 +768,7 @@ function VoiceAgentDesktop(): React.ReactElement {
             onClick={() => setDevMode((v) => !v)}
             style={{ background: devMode ? "#1d4ed8" : "#1f2937", border: "none", borderRadius: 6, padding: "5px 10px", cursor: "pointer" }}
           >
-            Dev HUD
+            开发者面板
           </button>
         </div>
       </header>
@@ -737,29 +777,29 @@ function VoiceAgentDesktop(): React.ReactElement {
         <section style={{ background: "#111827", border: "1px solid #1f2937", borderRadius: 12, padding: 16, display: "flex", flexDirection: "column", minHeight: 590 }}>
           <div style={{ flex: 1, overflowY: "auto", marginBottom: 14 }}>
             {turns.length === 0 && !partialText && (
-              <div style={{ color: "#64748b", padding: "48px 16px", textAlign: "center", lineHeight: 1.7 }}>
-                <div style={{ fontSize: 15, color: "#cbd5e1", marginBottom: 6 }}>VoiceAgent Desktop Ready</div>
-                Click <strong>Start Mic</strong> for full-duplex conversation (or press <strong>Alt+Space</strong> for Push-to-Talk),
-                or type below to test Pi Agent, guarded approvals, and live speech playback.
+              <div style={{ color: "#64748b", padding: "48px 16px", textAlign: "center", lineHeight: 1.8 }}>
+                <div style={{ fontSize: 15, color: "#cbd5e1", marginBottom: 6 }}>VoiceAgent 本地中文语音助手已就绪</div>
+                点击下方 <strong>开启麦克风</strong> 开始全双工语音对话（或按 <strong>Alt+Space</strong> 按键说话），
+                也可以直接在底部输入框打字体验中文播报与高危操作审批拦截。
               </div>
             )}
             {turns.map((t) => (
               <div key={t.turnId} style={{ marginBottom: 16 }}>
                 <div style={{ marginBottom: 4 }}>
-                  <span style={{ color: "#38bdf8", fontWeight: 600 }}>User: </span>
+                  <span style={{ color: "#38bdf8", fontWeight: 600 }}>用户：</span>
                   {t.userTranscript}
                 </div>
                 {t.toolCalls.map((tc) => (
                   <div key={tc.toolCallId} style={{ fontSize: 12, color: "#fbbf24", background: "#1e293b", padding: "6px 10px", borderRadius: 6, margin: "4px 0" }}>
-                    Tool <code>{tc.toolName}</code> [{tc.status}] {tc.sideEffectCommitted ? "(committed)" : ""}: {tc.result}
+                    工具 <code>{tc.toolName}</code> [{tc.status}] {tc.sideEffectCommitted ? "（已生效）" : ""}：{tc.result}
                   </div>
                 ))}
                 <div>
-                  <span style={{ color: "#34d399", fontWeight: 600 }}>Agent: </span>
+                  <span style={{ color: "#34d399", fontWeight: 600 }}>助手：</span>
                   {t.interrupted ? (
                     <>
-                      <span>{t.assistantAudibleReply || "(interrupted before first word)"}</span>
-                      <span style={{ color: "#f87171", fontSize: 12, marginLeft: 6 }}>[Interrupted — unheard suffix preserved]</span>
+                      <span>{t.assistantAudibleReply || "（尚未播报即被打断）"}</span>
+                      <span style={{ color: "#f87171", fontSize: 12, marginLeft: 6 }}>[已被打断 — 未播内容已保留]</span>
                     </>
                   ) : (
                     t.assistantFullReply
@@ -768,31 +808,31 @@ function VoiceAgentDesktop(): React.ReactElement {
               </div>
             ))}
             {partialText && (
-              <div style={{ color: "#93c5fd", fontStyle: "italic" }}>User (live): {partialText}</div>
+              <div style={{ color: "#93c5fd", fontStyle: "italic" }}>用户（实时识别）：{partialText}</div>
             )}
           </div>
 
           {pendingApproval && (
             <div role="dialog" style={{ border: "1px solid #f59e0b", background: "#451a03", borderRadius: 8, padding: 12, marginBottom: 12 }}>
-              <strong>Approval Required: {pendingApproval.toolName}</strong>
+              <strong>需要授权确认：{pendingApproval.toolName}</strong>
               <div style={{ fontSize: 13, marginTop: 4 }}>{pendingApproval.impactSummary}</div>
               <div style={{ fontSize: 11, color: "#fde68a", marginTop: 4 }}>
-                Click below or say "confirm" / "确认" (silence or ambiguous speech denies by default)
+                请点击下方按钮或直接说“确认”（沉默或含义不清默认拒绝）
               </div>
               <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
                 <button
                   type="button"
-                  onClick={() => void respondApproval(true, "ui", "Approved via desktop dialog")}
+                  onClick={() => void respondApproval(true, "ui", "已在桌面弹窗点击同意")}
                   style={{ background: "#16a34a", border: "none", borderRadius: 6, padding: "5px 14px", cursor: "pointer", fontWeight: 600 }}
                 >
-                  Approve
+                  同意执行
                 </button>
                 <button
                   type="button"
-                  onClick={() => void respondApproval(false, "ui", "Denied via desktop dialog")}
+                  onClick={() => void respondApproval(false, "ui", "已在桌面弹窗点击拒绝")}
                   style={{ background: "#dc2626", border: "none", borderRadius: 6, padding: "5px 14px", cursor: "pointer", fontWeight: 600 }}
                 >
-                  Deny
+                  拒绝
                 </button>
               </div>
             </div>
@@ -807,7 +847,7 @@ function VoiceAgentDesktop(): React.ReactElement {
                 onClick={() => void toggleMic()}
                 style={{ background: micActive ? "#dc2626" : "#2563eb", border: "none", borderRadius: 8, padding: "7px 14px", fontWeight: 600, cursor: "pointer" }}
               >
-                {micActive ? "Stop Mic" : "Start Mic"}
+                {micActive ? "关闭麦克风" : "开启麦克风"}
               </button>
 
               {(["hands-free", "push-to-talk", "text", "mute"] as InteractionMode[]).map((m) => (
@@ -827,7 +867,7 @@ function VoiceAgentDesktop(): React.ReactElement {
                     cursor: "pointer",
                   }}
                 >
-                  {m}
+                  {MODE_LABELS[m]}
                 </button>
               ))}
 
@@ -847,7 +887,7 @@ function VoiceAgentDesktop(): React.ReactElement {
                     cursor: "pointer",
                   }}
                 >
-                  {pttPressed ? "Talking... (Release)" : "Hold to Talk"}
+                  {pttPressed ? "正在录音...（松开结束）" : "按住说话"}
                 </button>
               )}
 
@@ -856,20 +896,20 @@ function VoiceAgentDesktop(): React.ReactElement {
                 onClick={() => triggerBargeInCancel("manual_stop")}
                 style={{ background: "#374151", border: "none", borderRadius: 8, padding: "7px 12px", cursor: "pointer", fontSize: 12 }}
               >
-                Stop / Barge-in
+                打断 / 停止播报
               </button>
             </div>
 
             <div style={{ display: "flex", gap: 8, fontSize: 12 }}>
               <label style={{ display: "flex", alignItems: "center", gap: 4, color: "#94a3b8" }}>
                 <input type="checkbox" checked={aecEnabled} onChange={(e) => setAecEnabled(e.target.checked)} />
-                AEC
+                回声消除
               </label>
               <span style={{ padding: "4px 8px", borderRadius: 999, background: micActive ? "#0c4a6e" : "#1f2937" }}>
-                Mic: {micActive ? (mode === "mute" ? "Muted" : "Listening") : "Idle"}
+                麦克风：{micActive ? (mode === "mute" ? "已静音" : "监听中") : "未开启"}
               </span>
               <span style={{ padding: "4px 8px", borderRadius: 999, background: assistantState === "speaking" ? "#065f46" : "#1f2937" }}>
-                Agent: {assistantState}
+                助手：{ASSISTANT_STATE_LABELS[assistantState] ?? assistantState}
               </span>
             </div>
           </div>
@@ -888,11 +928,11 @@ function VoiceAgentDesktop(): React.ReactElement {
               type="text"
               value={textInput}
               onChange={(e) => setTextInput(e.target.value)}
-              placeholder="Speak or type here (try typing 'delete temp.log' to test approval guard)..."
+              placeholder="直接说话或在此输入中文（输入“删除测试文件”可体验高危操作弹窗拦截）..."
               style={{ flex: 1, background: "#0b0f17", border: "1px solid #374151", borderRadius: 8, padding: "8px 12px" }}
             />
             <button type="submit" style={{ background: "#0ea5e9", border: "none", borderRadius: 8, padding: "8px 16px", fontWeight: 600, cursor: "pointer" }}>
-              Send
+              发送
             </button>
           </form>
           {statusNote && <div style={{ color: "#fbbf24", fontSize: 12, marginTop: 8 }}>{statusNote}</div>}
@@ -901,29 +941,29 @@ function VoiceAgentDesktop(): React.ReactElement {
         {devMode && (
           <aside style={{ background: "#111827", border: "1px solid #1f2937", borderRadius: 12, padding: 16, fontSize: 13, display: "flex", flexDirection: "column", gap: 12 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <strong>Developer Telemetry HUD</strong>
+              <strong>开发者实时监控面板</strong>
               <button
                 type="button"
                 onClick={() => void handleExportLogs()}
                 style={{ background: "#1f2937", border: "1px solid #374151", borderRadius: 6, padding: "3px 8px", fontSize: 11, cursor: "pointer" }}
               >
-                Export JSONL
+                导出 JSONL 日志
               </button>
             </div>
 
             <div>
-              <div style={{ color: "#94a3b8", marginBottom: 4 }}>Silero VAD Probability: {(vadProb * 100).toFixed(1)}%</div>
+              <div style={{ color: "#94a3b8", marginBottom: 4 }}>Silero VAD 语音概率：{(vadProb * 100).toFixed(1)}%</div>
               <div style={{ height: 8, background: "#1f2937", borderRadius: 4, overflow: "hidden" }}>
                 <div style={{ width: `${Math.min(100, vadProb * 100)}%`, height: "100%", background: "#38bdf8" }} />
               </div>
             </div>
 
             <div>
-              <div style={{ color: "#94a3b8", marginBottom: 6 }}>Causal GRU Turn Adapter</div>
+              <div style={{ color: "#94a3b8", marginBottom: 6 }}>Causal GRU 轮次预测概率</div>
               {[
-                ["Completion (EOT)", adapterProb?.pCompletion ?? 0, "#22c55e"],
-                ["Floor Taking (Interrupt)", adapterProb?.pFloorTaking ?? 0, "#ef4444"],
-                ["Non-Floor (Backchannel)", adapterProb?.pNonFloorFeedback ?? 0, "#eab308"],
+                ["发言完成 (EOT)", adapterProb?.pCompletion ?? 0, "#22c55e"],
+                ["主动打断 (Interrupt)", adapterProb?.pFloorTaking ?? 0, "#ef4444"],
+                ["短暂附和 (Backchannel)", adapterProb?.pNonFloorFeedback ?? 0, "#eab308"],
               ].map(([label, val, color]) => (
                 <div key={String(label)} style={{ marginBottom: 6 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
@@ -938,20 +978,20 @@ function VoiceAgentDesktop(): React.ReactElement {
             </div>
 
             <div style={{ borderTop: "1px solid #1f2937", paddingTop: 10, display: "grid", gap: 4 }}>
-              <div><strong>Latency</strong></div>
-              <div>TTFA: {lastLatencyMs.ttfa ?? "-"} ms</div>
-              <div>E2E Audible: {lastLatencyMs.e2e ?? "-"} ms</div>
-              <div>Barge-in Stop: {lastLatencyMs.bargeIn ?? "-"} ms</div>
+              <div><strong>实时延迟</strong></div>
+              <div>首包延迟 (TTFA)：{lastLatencyMs.ttfa ?? "-"} ms</div>
+              <div>端到端播报 (E2E)：{lastLatencyMs.e2e ?? "-"} ms</div>
+              <div>打断停播延迟：{lastLatencyMs.bargeIn ?? "-"} ms</div>
             </div>
 
             <div style={{ borderTop: "1px solid #1f2937", paddingTop: 10, display: "grid", gap: 4, fontSize: 12 }}>
-              <div><strong>RTX 5070 & Active Models</strong></div>
-              <div>Device: {health?.vram.device ?? "checking..."}</div>
-              <div>VRAM: {health ? `${health.vram.allocated_mb} / ${health.vram.total_mb} MB` : "-"}</div>
-              <div>VAD: {health?.models.vad?.backend ?? "-"}</div>
-              <div>ASR: {health?.models.asr.backend ?? health?.models.asr.model_id ?? "-"}</div>
-              <div>TTS: {health?.models.tts.backend ?? health?.models.tts.model_id ?? "-"}</div>
-              <div>Turn Adapter: {health?.models.turn_adapter.version ?? "-"} ({health?.models.turn_adapter.params ?? 0} params)</div>
+              <div><strong>RTX 5070 与在线模型</strong></div>
+              <div>设备：{health?.vram.device ?? "检测中..."}</div>
+              <div>显存：{health ? `${health.vram.allocated_mb} / ${health.vram.total_mb} MB` : "-"}</div>
+              <div>VAD：{health?.models.vad?.backend ?? "-"}</div>
+              <div>ASR：{health?.models.asr.backend ?? health?.models.asr.model_id ?? "-"}</div>
+              <div>TTS：{health?.models.tts.backend ?? health?.models.tts.model_id ?? "-"}</div>
+              <div>轮次模型：{health?.models.turn_adapter.version ?? "-"}（{health?.models.turn_adapter.params ?? 0} 参数）</div>
             </div>
           </aside>
         )}
