@@ -86,6 +86,7 @@ function createWindow() {
     minHeight: 640,
     show: !isSmoke,
     backgroundColor: "#0b0f17",
+    icon: path.join(__dirname, "assets", "voiceagent.ico"),
     title: "VoiceAgent — Full-Duplex Local Voice Assistant",
     autoHideMenuBar: true,
     webPreferences: {
