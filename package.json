@@ -2,21 +2,33 @@
   "name": "voice-agent",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "description": "Full-duplex local desktop voice agent powered by Pi Agent, Nemotron Streaming ASR, Causal Turn Adapter, and Qwen3-TTS",
   "license": "MIT",
-  "packageManager": "pnpm@10.6.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "engines": {
     "node": ">=22.0.0"
   },
   "scripts": {
-    "dev": "pnpm --filter @voice-agent/desktop dev",
-    "build": "pnpm -r build",
-    "typecheck": "pnpm -r typecheck",
+    "dev": "npm --workspace=@voice-agent/desktop run dev",
+    "build": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest",
-    "lint": "pnpm -r lint"
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "ws": "^8.18.1"
   },
   "devDependencies": {
+    "@types/node": "^22.13.10",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "@types/ws": "^8.18.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
     "typescript": "^5.8.2",
     "vitest": "^3.0.8"
   }
