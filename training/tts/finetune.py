@@ -6,9 +6,21 @@ zero-shot baseline promotion gate (PRD §6.3, TTS-A0..A3).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
+
+
+@dataclass
+class TtsFinetuneSpec:
+    """Configuration contract for Qwen3-TTS speaker voice adaptation experiments."""
+
+    experiment_id: str
+    speaker_id: str
+    mode: Literal["pretrained", "zero_shot", "speaker_finetune"]
+    base_model: str = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    reference_audio_path: str | None = None
+    learning_rate: float = 5e-5
 
 
 @dataclass

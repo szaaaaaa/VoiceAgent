@@ -212,6 +212,15 @@ export class PiAgentConnector {
           }
 
           params.callbacks?.onToolStart?.(event.call, risk);
+          const argsSummary = JSON.stringify(event.call.args).slice(0, 200);
+          this.history.recordToolExecution(params.turnId, {
+            toolCallId: event.call.toolCallId,
+            toolName: event.call.toolName,
+            argsSummary,
+            status: "running",
+            sideEffectCommitted: false,
+            result: "in_flight",
+          });
           const startedAt = performance.now();
           const result = await this.tools.invoke(
             event.call.toolName,
@@ -221,14 +230,19 @@ export class PiAgentConnector {
             controller.signal,
           );
           const durationMs = Math.round(performance.now() - startedAt);
+          const finalStatus =
+            result.status === "error" && controller.signal.aborted ? "cancelled" : result.status;
           this.history.recordToolExecution(params.turnId, {
             toolCallId: event.call.toolCallId,
             toolName: event.call.toolName,
-            argsSummary: JSON.stringify(event.call.args).slice(0, 200),
-            status: result.status,
+            argsSummary,
+            status: finalStatus,
+            sideEffectCommitted: finalStatus === "ok" && risk !== "readonly",
             result: result.output,
           });
-          params.callbacks?.onToolEnd?.(event.call, result.status, result.output, durationMs);
+          if (finalStatus !== "cancelled") {
+            params.callbacks?.onToolEnd?.(event.call, finalStatus, result.output, durationMs);
+          }
         }
       }
 

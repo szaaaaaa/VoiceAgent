@@ -37,6 +37,46 @@ SYSTEM_SCENARIOS: tuple[dict[str, str], ...] = (
 
 
 @dataclass
+class PerformanceProfileSnapshot:
+    """Core 6 hardware/system performance metrics for RTX 5070 Laptop 8GB optimization tracking."""
+
+    label: str  # e.g., "baseline_fp32" or "optimized_bf16_stream"
+    asr_rtf: float
+    tts_ttfa_ms: float
+    e2e_latency_p50_ms: float
+    e2e_latency_p95_ms: float
+    barge_in_latency_p95_ms: float
+    peak_vram_mb: float
+    false_interruption_rate: float
+
+
+def compare_before_after_optimization(
+    before: PerformanceProfileSnapshot,
+    after: PerformanceProfileSnapshot,
+) -> dict[str, Any]:
+    """Computes before/after deltas across all 6 core performance metrics (negative = improved)."""
+    return {
+        "before_label": before.label,
+        "after_label": after.label,
+        "before": asdict(before),
+        "after": asdict(after),
+        "delta": {
+            "asr_rtf": round(after.asr_rtf - before.asr_rtf, 5),
+            "tts_ttfa_ms": round(after.tts_ttfa_ms - before.tts_ttfa_ms, 2),
+            "e2e_latency_p50_ms": round(after.e2e_latency_p50_ms - before.e2e_latency_p50_ms, 2),
+            "e2e_latency_p95_ms": round(after.e2e_latency_p95_ms - before.e2e_latency_p95_ms, 2),
+            "barge_in_latency_p95_ms": round(
+                after.barge_in_latency_p95_ms - before.barge_in_latency_p95_ms, 2
+            ),
+            "peak_vram_mb": round(after.peak_vram_mb - before.peak_vram_mb, 1),
+            "false_interruption_rate": round(
+                after.false_interruption_rate - before.false_interruption_rate, 5
+            ),
+        },
+    }
+
+
+@dataclass
 class ExperimentManifest:
     experiment_id: str
     dataset_version: str

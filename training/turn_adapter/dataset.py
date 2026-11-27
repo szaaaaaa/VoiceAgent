@@ -6,7 +6,9 @@ Enforces strict session isolation across train / val / test splits (PRD §6.2).
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -127,3 +129,32 @@ class TurnSequenceDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.Tensor
             torch.from_numpy(s.playback_state),
             torch.from_numpy(s.labels),
         )
+
+
+def load_real_dialogue_jsonl(manifest_path: str | Path) -> list[TurnSessionSample]:
+    """
+    Loads real conversational turn-taking datasets (e.g., Mundo TurnBench, Switchboard,
+    or Voice-Light pre-extracted feature manifests) into `TurnSessionSample` items.
+    Each JSONL row expects:
+      {"session_id": str, "features_npy": str, "playback_npy": str, "labels_npy": str}
+    """
+    base_dir = Path(manifest_path).parent
+    samples: list[TurnSessionSample] = []
+    for raw in Path(manifest_path).read_text(encoding="utf-8").splitlines():
+        if not raw.strip():
+            continue
+        row = json.loads(raw)
+        feats = np.load(base_dir / row["features_npy"]).astype(np.float32)
+        playback = np.load(base_dir / row["playback_npy"]).astype(np.float32)
+        labels = np.load(base_dir / row["labels_npy"]).astype(np.float32)
+        if playback.ndim == 1:
+            playback = playback[:, None]
+        samples.append(
+            TurnSessionSample(
+                session_id=str(row["session_id"]),
+                encoder_features=feats,
+                playback_state=playback,
+                labels=labels,
+            )
+        )
+    return samples

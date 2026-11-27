@@ -31,6 +31,18 @@ class TurnTrainResult:
     calibrated_thresholds: dict[str, float]
     test_f1_by_head: dict[str, float]
     causality_max_diff: float
+    parameter_count: int = 0
+
+
+@dataclass
+class TurnAblationSpec:
+    """Configuration unit for GRU architecture & feature-source ablation sweeps."""
+
+    name: str
+    feature_source: str = "asr_encoder"  # "asr_encoder" | "acoustic_logmel"
+    hidden_dim: int = 128
+    num_layers: int = 2
+    num_encoder_taps: int = 1
 
 
 def _binary_f1(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> float:
@@ -108,6 +120,10 @@ def train_turn_adapter(
     samples: list[TurnSessionSample] | None = None,
     *,
     output_path: str | Path = "models/turn_adapter/causal_gru_v1.pt",
+    hidden_dim: int = 128,
+    num_layers: int = 2,
+    num_encoder_taps: int = 1,
+    feature_source: str = "asr_encoder",
     epochs: int = 8,
     batch_size: int = 8,
     lr: float = 3e-3,
@@ -126,7 +142,13 @@ def train_turn_adapter(
     val_loader = DataLoader(TurnSequenceDataset(val_s), batch_size=batch_size, shuffle=False)
     test_loader = DataLoader(TurnSequenceDataset(test_s), batch_size=batch_size, shuffle=False)
 
-    cfg = TurnAdapterConfig(encoder_feature_dim=feature_dim)
+    cfg = TurnAdapterConfig(
+        encoder_feature_dim=feature_dim,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        num_encoder_taps=num_encoder_taps,
+        feature_source=feature_source,
+    )
     model = CausalTurnGRU(cfg).to(dev)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = nn.BCEWithLogitsLoss()
@@ -184,4 +206,31 @@ def train_turn_adapter(
         calibrated_thresholds=thresholds,
         test_f1_by_head=test_f1,
         causality_max_diff=causality_diff,
+        parameter_count=model.parameter_count(),
     )
+
+
+def run_turn_ablation_grid(
+    specs: list[TurnAblationSpec],
+    samples: list[TurnSessionSample],
+    output_dir: str | Path,
+    *,
+    epochs: int = 8,
+    device: str | None = None,
+) -> dict[str, TurnTrainResult]:
+    """Runs controlled GRU depth/width/feature-tap ablations on identical session splits."""
+    out_root = Path(output_dir)
+    results: dict[str, TurnTrainResult] = {}
+    for spec in specs:
+        ckpt = out_root / f"{spec.name}.pt"
+        results[spec.name] = train_turn_adapter(
+            samples,
+            output_path=ckpt,
+            hidden_dim=spec.hidden_dim,
+            num_layers=spec.num_layers,
+            num_encoder_taps=spec.num_encoder_taps,
+            feature_source=spec.feature_source,
+            epochs=epochs,
+            device=device,
+        )
+    return results

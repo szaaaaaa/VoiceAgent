@@ -19,21 +19,27 @@ export interface AudioDeviceDescriptor {
   kind: "audioinput" | "audiooutput";
 }
 
+export interface AecProcessor {
+  process(micPcm16k: Int16Array, refPcm16k: Int16Array): Int16Array;
+  reset(): void;
+}
+
 export interface AudioCaptureConfig {
   frameDurationMs?: number;
   prerollMs?: number;
   ringBufferSeconds?: number;
   aecEnabled?: boolean;
+  aecProcessor?: AecProcessor;
   noiseSuppressionEnabled?: boolean;
   noiseGateDb?: number;
 }
 
 /**
  * Lightweight normalized LMS adaptive filter for acoustic echo cancellation.
- * shortcut: 64-tap time-domain NLMS handles short desktop echo paths; upgrade to native
- * WebRTC APM (AEC3) when deploying for high-volume reverberant room speakers.
+ * shortcut: 64-tap time-domain NLMS handles short desktop echo paths; inject WebRTC APM (AEC3)
+ * via `AudioCaptureConfig.aecProcessor` for high-volume reverberant loudspeaker setups.
  */
-export class AdaptiveAecFilter {
+export class AdaptiveAecFilter implements AecProcessor {
   private readonly weights: Float32Array;
   private readonly refHistory: Float32Array;
   private readonly stepSize: number;
@@ -89,7 +95,7 @@ export class AudioCapturePipeline {
   readonly frameSamples: number;
   readonly ringBuffer: Int16RingBuffer;
   readonly preRoll: PreRollBuffer;
-  private readonly aec: AdaptiveAecFilter;
+  private readonly aec: AecProcessor;
   private readonly aecRefQueue: Int16Array[] = [];
   private aecRefSamples = 0;
   private readonly maxAecRefSamples = TARGET_ASR_SAMPLE_RATE * 2;
@@ -108,7 +114,7 @@ export class AudioCapturePipeline {
     this.ringBuffer = new Int16RingBuffer(
       TARGET_ASR_SAMPLE_RATE * (config.ringBufferSeconds ?? 30),
     );
-    this.aec = new AdaptiveAecFilter();
+    this.aec = config.aecProcessor ?? new AdaptiveAecFilter();
     this.aecEnabled = config.aecEnabled ?? true;
     this.noiseSuppressionEnabled = config.noiseSuppressionEnabled ?? true;
     this.noiseGateDb = config.noiseGateDb ?? -58;

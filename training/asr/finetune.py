@@ -7,9 +7,22 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
+
+
+@dataclass
+class AsrFinetuneSpec:
+    """Configuration contract for targeted ASR fine-tuning experiments (accent / vocab / noise)."""
+
+    experiment_id: str
+    direction: Literal["accent", "domain_vocab", "noise_robustness"]
+    method: Literal["pretrained_baseline", "hotword_boosting", "lora", "full_finetune"]
+    base_model: str = "nvidia/nemotron-speech-streaming-en-0.6b"
+    lora_rank: int = 16
+    learning_rate: float = 1e-4
+    augment_noise_snr_db: float | None = None
 
 
 @dataclass

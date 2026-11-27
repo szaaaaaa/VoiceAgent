@@ -10,19 +10,38 @@ import pytest
 from starlette.testclient import TestClient
 
 from evaluation.asr.metrics import evaluate_asr_predictions
-from evaluation.end_to_end.benchmark import SYSTEM_SCENARIOS, ExperimentManifest
+from evaluation.end_to_end.benchmark import (
+    SYSTEM_SCENARIOS,
+    ExperimentManifest,
+    PerformanceProfileSnapshot,
+    compare_before_after_optimization,
+)
 from evaluation.interruption.metrics import compute_erle_db, evaluate_interruption
 from evaluation.tts.metrics import evaluate_tts_samples
 from evaluation.turn_taking.metrics import evaluate_turn_taking
 from inference.protocol import StreamKind, decode_audio_frame, encode_audio_frame, make_event
 from inference.server import create_app
+from inference.turn_adapter.baselines import FixedSilenceBaseline, SmartTurnBaseline
 from inference.turn_adapter.model import CausalTurnGRU, TurnAdapterConfig
 from inference.turn_adapter.predictor import TurnAdapterPredictor
-from training.asr.finetune import augment_waveform, check_general_wer_regression
+from training.asr.finetune import AsrFinetuneSpec, augment_waveform, check_general_wer_regression
 from training.registry import CheckpointRecord, CheckpointRegistry
-from training.tts.finetune import audit_tts_recording, verify_finetune_beats_zeroshot
-from training.turn_adapter.dataset import generate_synthetic_turn_dataset, split_by_session
-from training.turn_adapter.train import train_turn_adapter, verify_streaming_causality
+from training.tts.finetune import (
+    TtsFinetuneSpec,
+    audit_tts_recording,
+    verify_finetune_beats_zeroshot,
+)
+from training.turn_adapter.dataset import (
+    generate_synthetic_turn_dataset,
+    load_real_dialogue_jsonl,
+    split_by_session,
+)
+from training.turn_adapter.train import (
+    TurnAblationSpec,
+    run_turn_ablation_grid,
+    train_turn_adapter,
+    verify_streaming_causality,
+)
 
 
 def test_binary_protocol_roundtrip_and_validation() -> None:
@@ -279,3 +298,85 @@ def test_training_gates_and_evaluation_metrics_suite(tmp_path: Path) -> None:
     loaded = json.loads(out.read_text(encoding="utf-8"))
     assert loaded["beats_baseline"] is False
     assert "hybrid fallback" in loaded["conclusion"]
+
+
+def test_turn_baselines_ablation_multitap_and_perf_comparison(tmp_path: Path) -> None:
+    import torch
+
+    # 1. Multi-layer encoder tap fusion (B, K=2, T=6, D=32) works causally.
+    tap_model = CausalTurnGRU(
+        TurnAdapterConfig(encoder_feature_dim=32, hidden_dim=64, num_layers=1, num_encoder_taps=2)
+    )
+    multi_taps = torch.randn(1, 2, 6, 32)
+    pb = torch.zeros(1, 6, 1)
+    logits, _ = tap_model(multi_taps, pb)
+    assert logits.shape == (1, 6, 3)
+
+    # 2. FixedSilenceBaseline & SmartTurnBaseline match (T, 3) output contract.
+    samples = generate_synthetic_turn_dataset(num_sessions=12, seq_len=24, feature_dim=32, seed=11)
+    s0 = samples[0]
+    fixed_probs = FixedSilenceBaseline().predict_sequence(s0.encoder_features, s0.playback_state)
+    smart_probs = SmartTurnBaseline().predict_sequence(s0.encoder_features, s0.playback_state)
+    assert fixed_probs.shape == (24, 3)
+    assert smart_probs.shape == (24, 3)
+
+    # 3. Real dialogue JSONL loader + GRU layer/width ablation grid.
+    np.save(tmp_path / "f0.npy", s0.encoder_features)
+    np.save(tmp_path / "p0.npy", s0.playback_state)
+    np.save(tmp_path / "l0.npy", s0.labels)
+    manifest_file = tmp_path / "real_turns.jsonl"
+    manifest_file.write_text(
+        json.dumps(
+            {
+                "session_id": "real_01",
+                "features_npy": "f0.npy",
+                "playback_npy": "p0.npy",
+                "labels_npy": "l0.npy",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    loaded_real = load_real_dialogue_jsonl(manifest_file)
+    assert len(loaded_real) == 1 and loaded_real[0].session_id == "real_01"
+
+    ablation_res = run_turn_ablation_grid(
+        [
+            TurnAblationSpec(name="gru_1x32", hidden_dim=32, num_layers=1),
+            TurnAblationSpec(name="gru_2x64", hidden_dim=64, num_layers=2),
+        ],
+        samples,
+        tmp_path / "ablations",
+        epochs=2,
+        device="cpu",
+    )
+    assert ablation_res["gru_2x64"].parameter_count > ablation_res["gru_1x32"].parameter_count
+
+    # 4. Fine-tune specs & 6-metric before/after hardware optimization comparison.
+    asr_spec = AsrFinetuneSpec(experiment_id="ASR-A2", direction="domain_vocab", method="lora")
+    tts_spec = TtsFinetuneSpec(experiment_id="TTS-A2", speaker_id="spk_01", mode="speaker_finetune")
+    assert asr_spec.lora_rank == 16 and tts_spec.speaker_id == "spk_01"
+
+    before = PerformanceProfileSnapshot(
+        label="fp32_eager",
+        asr_rtf=0.38,
+        tts_ttfa_ms=540.0,
+        e2e_latency_p50_ms=1780.0,
+        e2e_latency_p95_ms=2650.0,
+        barge_in_latency_p95_ms=240.0,
+        peak_vram_mb=7420.0,
+        false_interruption_rate=0.08,
+    )
+    after = PerformanceProfileSnapshot(
+        label="bf16_cached_stream",
+        asr_rtf=0.16,
+        tts_ttfa_ms=260.0,
+        e2e_latency_p50_ms=940.0,
+        e2e_latency_p95_ms=1490.0,
+        barge_in_latency_p95_ms=135.0,
+        peak_vram_mb=5180.0,
+        false_interruption_rate=0.03,
+    )
+    comp = compare_before_after_optimization(before, after)
+    assert comp["delta"]["e2e_latency_p50_ms"] < 0
+    assert comp["delta"]["peak_vram_mb"] < 0

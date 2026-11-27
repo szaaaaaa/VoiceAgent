@@ -10,7 +10,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from inference.asr.base import ASRStepOutput
+from inference.asr.base import ASRStepOutput, FeatureSource, StreamingEncoderCache
 
 
 class StreamingVAD:
@@ -52,7 +52,7 @@ class _SessionASRState:
     accumulated_samples: int = 0
     speech_chunks: int = 0
     last_partial: str = ""
-    nemo_cache: Any = None
+    encoder_cache: StreamingEncoderCache = field(default_factory=StreamingEncoderCache)
 
 
 class NemotronStreamingASR:
@@ -69,6 +69,7 @@ class NemotronStreamingASR:
         *,
         chunk_size_ms: int = 80,
         feature_dim: int = 128,
+        feature_source: FeatureSource = "asr_encoder",
         device: str | None = None,
         load_heavy_model: bool = False,
     ) -> None:
@@ -76,6 +77,7 @@ class NemotronStreamingASR:
         self.chunk_size_ms = chunk_size_ms
         self.chunk_samples = int(16000 * chunk_size_ms / 1000)
         self.feature_dim = feature_dim
+        self.feature_source: FeatureSource = feature_source
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.checkpoint_path: str | None = None
         self._sessions: dict[str, _SessionASRState] = {}
@@ -145,14 +147,22 @@ class NemotronStreamingASR:
         if is_speech:
             state.speech_chunks += 1
 
-        taps: torch.Tensor | None = None
-        if extract_features and samples.size > 0:
-            taps = self._extract_causal_features(samples)
-
         partial = state.last_partial
         if self._nemo_model is not None and state.accumulated_samples >= self.chunk_samples:
             partial = self._run_nemo_streaming_step(state)
-        elif is_speech and state.speech_chunks >= 3:
+
+        taps: torch.Tensor | None = None
+        active_source: FeatureSource = self.feature_source
+        if extract_features and samples.size > 0:
+            if self.feature_source == "asr_encoder" and self._encoder_hook_outputs:
+                # Stack captured intermediate encoder layers: (1, num_taps, frames, dim)
+                stacked = torch.stack(self._encoder_hook_outputs, dim=1)
+                taps = stacked[..., : self.feature_dim]
+            else:
+                active_source = "acoustic_logmel"
+                taps = self._extract_causal_features(samples)
+
+        if self._nemo_model is None and is_speech and state.speech_chunks >= 3:
             # shortcut: deterministic offline placeholder when NeMo weights are not loaded;
             # real transcription activates automatically when Nemotron weights are installed.
             partial = f"[speech_stream_{state.speech_chunks}]"
@@ -164,6 +174,7 @@ class NemotronStreamingASR:
             is_final=False,
             encoder_taps=taps,
             compute_time_ms=elapsed_ms,
+            feature_source=active_source,
         )
 
     def finalize_utterance(self, session_id: str) -> ASRStepOutput:

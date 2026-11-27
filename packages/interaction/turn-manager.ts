@@ -6,7 +6,21 @@
 
 export type TurnStrategy = "fixed_silence" | "vad_only" | "smart_turn" | "adapter" | "hybrid";
 
-export type TurnEventKind = "EOT" | "HOLD" | "BACKCHANNEL" | "INTERRUPTION" | "NOISE";
+export type TurnEventKind =
+  | "EOT"
+  | "HOLD"
+  | "BACKCHANNEL"
+  | "INTERRUPTION"
+  | "SHORT_INTERJECTION"
+  | "NOISE";
+
+export type TurnFollowUpAction =
+  | "commit_turn"
+  | "continue_listening"
+  | "resume_playback"
+  | "cancel_and_listen"
+  | "cancel_and_regenerate"
+  | "ignore";
 
 export interface TurnAdapterProbabilities {
   pCompletion: number;
@@ -26,6 +40,7 @@ export interface TurnObservation {
 
 export interface TurnDecision {
   event: TurnEventKind;
+  action?: TurnFollowUpAction;
   confidence: number;
   source: string;
   reason: string;
@@ -65,6 +80,18 @@ const BACKCHANNEL_PHRASES = new Set([
   "明白",
   "行",
   "对",
+]);
+
+const RESUME_INTERJECTION_PHRASES = new Set([
+  "go on",
+  "keep going",
+  "continue",
+  "never mind go on",
+  "sorry go on",
+  "你继续",
+  "继续说",
+  "没事继续",
+  "算了你继续",
 ]);
 
 const INTERRUPT_CUES = [
@@ -204,9 +231,30 @@ export class HybridTurnManager {
     ) {
       return {
         event: "BACKCHANNEL",
+        action: "resume_playback",
         confidence: adapter ? Math.max(0.75, adapter.pNonFloorFeedback) : 0.8,
         source: adapter ? "hybrid_backchannel" : "lexical_backchannel",
         reason: `Short acknowledgement "${norm}"`,
+      };
+    }
+
+    // Brief interjection followed by user stopping: resume or regenerate based on semantics (Scenario 6).
+    if (!obs.vadInSpeech && obs.silenceDurationMs >= 220 && norm.length > 0) {
+      if (RESUME_INTERJECTION_PHRASES.has(norm)) {
+        return {
+          event: "SHORT_INTERJECTION",
+          action: "resume_playback",
+          confidence: 0.88,
+          source: "post_interjection_semantic",
+          reason: `User yielded floor back after brief interjection: "${norm}"`,
+        };
+      }
+      return {
+        event: "SHORT_INTERJECTION",
+        action: "cancel_and_regenerate",
+        confidence: adapter ? Math.max(0.8, adapter.pCompletion) : 0.82,
+        source: "post_interjection_semantic",
+        reason: `Completed short directive interjection "${norm}" -> regenerate reply`,
       };
     }
 

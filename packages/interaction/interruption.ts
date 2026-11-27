@@ -73,13 +73,20 @@ export class InterruptionController {
       return { resolution: "ignored" };
     }
 
-    if (decision.event === "NOISE" || decision.event === "BACKCHANNEL") {
+    if (
+      decision.event === "NOISE" ||
+      decision.event === "BACKCHANNEL" ||
+      (decision.event === "SHORT_INTERJECTION" && decision.action === "resume_playback")
+    ) {
       this.suspectedActive = false;
       this.playback.resume();
       return { resolution: "resumed" };
     }
 
-    if (decision.event === "INTERRUPTION") {
+    if (
+      decision.event === "INTERRUPTION" ||
+      (decision.event === "SHORT_INTERJECTION" && decision.action === "cancel_and_regenerate")
+    ) {
       this.suspectedActive = false;
       const turnId = this.tracker.ids.turnId;
       if (turnId) {

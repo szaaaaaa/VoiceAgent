@@ -3,18 +3,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 import numpy as np
 import torch
+
+FeatureSource = Literal["asr_encoder", "acoustic_logmel"]
+
+
+@dataclass(slots=True)
+class StreamingEncoderCache:
+    """Cache tensors carried across streaming FastConformer/Nemotron chunks (zero re-encoding)."""
+
+    cache_last_channel: torch.Tensor | None = None
+    cache_last_time: torch.Tensor | None = None
+    cache_last_channel_len: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
 class ASRStepOutput:
     partial_text: str
     is_final: bool
-    encoder_taps: torch.Tensor | None  # Shape: (1, frames, feature_dim), strictly causal
+    encoder_taps: torch.Tensor | None  # Shape: (1, frames, dim) or (1, taps, frames, dim), causal
     compute_time_ms: float
+    feature_source: FeatureSource = "asr_encoder"
 
 
 class StreamingASRBackend(Protocol):

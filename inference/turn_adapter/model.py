@@ -22,6 +22,8 @@ class TurnAdapterConfig:
     encoder_feature_dim: int = 128
     hidden_dim: int = 128
     num_layers: int = 2
+    num_encoder_taps: int = 1
+    feature_source: str = "asr_encoder"  # "asr_encoder" | "acoustic_logmel"
     dropout: float = 0.1
     eot_threshold: float = 0.72
     interruption_threshold: float = 0.68
@@ -34,6 +36,8 @@ class CausalTurnGRU(nn.Module):
     def __init__(self, config: TurnAdapterConfig | None = None) -> None:
         super().__init__()
         self.config = config or TurnAdapterConfig()
+        # Learnable scalar weights to fuse multi-layer frozen ASR encoder taps when K > 1.
+        self.tap_weights = nn.Parameter(torch.zeros(max(1, self.config.num_encoder_taps)))
         in_dim = self.config.encoder_feature_dim + 1  # +1 for assistant_playback_state scalar
         self.input_norm = nn.LayerNorm(in_dim)
         self.input_proj = nn.Linear(in_dim, self.config.hidden_dim)
@@ -64,6 +68,10 @@ class CausalTurnGRU(nn.Module):
             logits: (batch, seq_len, 3)
             next_hidden: (num_layers, batch, hidden_dim)
         """
+        if encoder_features.ndim == 4:
+            # Multi-layer encoder taps: (batch, taps, seq_len, dim) -> weighted causal sum.
+            weights = torch.softmax(self.tap_weights[: encoder_features.shape[1]], dim=0)
+            encoder_features = torch.einsum("k,bktd->btd", weights, encoder_features)
         if assistant_playback_state.ndim == 2:
             assistant_playback_state = assistant_playback_state.unsqueeze(-1)
         x = torch.cat([encoder_features, assistant_playback_state], dim=-1)

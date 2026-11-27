@@ -123,6 +123,28 @@ describe("hybrid turn manager, full-duplex interruption, and speculative isolati
         adapter: { pCompletion: 0.05, pFloorTaking: 0.08, pNonFloorFeedback: 0.1 },
       }).event,
     ).toBe("NOISE");
+
+    // Scenario 6a: Short interjection yielding floor back ("sorry go on" / "你继续") -> resume
+    const yieldDecision = tm.evaluate({
+      vadInSpeech: false,
+      speechDurationMs: 360,
+      silenceDurationMs: 260,
+      assistantSpeaking: true,
+      transcript: "你继续",
+    });
+    expect(yieldDecision.event).toBe("SHORT_INTERJECTION");
+    expect(yieldDecision.action).toBe("resume_playback");
+
+    // Scenario 6b: Short directive interjection followed by silence -> cancel and regenerate
+    const regenDecision = tm.evaluate({
+      vadInSpeech: false,
+      speechDurationMs: 420,
+      silenceDurationMs: 280,
+      assistantSpeaking: true,
+      transcript: "换成中文回答",
+    });
+    expect(regenDecision.event).toBe("SHORT_INTERJECTION");
+    expect(regenDecision.action).toBe("cancel_and_regenerate");
   });
 
   it("resumes on backchannel and cancels + preserves executed tool history on interruption", () => {
@@ -141,7 +163,16 @@ describe("hybrid turn manager, full-duplex interruption, and speculative isolati
       toolName: "system.info",
       argsSummary: "{}",
       status: "ok",
+      sideEffectCommitted: true,
       result: "16GB RAM free",
+    });
+    history.recordToolExecution(turnId, {
+      toolCallId: "tc_2",
+      toolName: "fs.read",
+      argsSummary: '{"path":"notes.md"}',
+      status: "running",
+      sideEffectCommitted: false,
+      result: "in_flight",
     });
     const fullText = "Your system has sixteen gigabytes free and all drives are healthy.";
     history.recordAssistantReply(turnId, fullText, fullText);
@@ -186,6 +217,12 @@ describe("hybrid turn manager, full-duplex interruption, and speculative isolati
     const assistantMsg = msgs.find((m) => m.role === "assistant")!;
     expect(assistantMsg.content).toContain("[interrupted by user");
     expect(assistantMsg.content.length).toBeLessThan(fullText.length + 45);
+
+    const syncSnap = history.getTurnSyncSnapshot(turnId)!;
+    expect(syncSnap.heardPrefix.length).toBeGreaterThan(0);
+    expect(syncSnap.unheardSuffix.length).toBeGreaterThan(0);
+    expect(syncSnap.committedTools.map((t) => t.toolCallId)).toEqual(["tc_1"]);
+    expect(syncSnap.cancelledOrDeniedTools[0]?.status).toBe("cancelled");
   });
 
   it("enforces speculative generation commit/discard and forbids external tools", () => {
