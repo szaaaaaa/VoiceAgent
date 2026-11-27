@@ -45,7 +45,19 @@ class Qwen3StreamingTTS:
             from qwen_tts import Qwen3TTSModel  # type: ignore[import-not-found]
 
             dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
-            self._model = Qwen3TTSModel.from_pretrained(model_ref, dtype=dtype).to(self.device)
+            try:
+                self._model = Qwen3TTSModel.from_pretrained(
+                    model_ref,
+                    dtype=dtype,
+                    device_map=self.device,
+                    attn_implementation="sdpa",
+                )
+            except TypeError:
+                self._model = Qwen3TTSModel.from_pretrained(
+                    model_ref,
+                    dtype=dtype,
+                    device_map=self.device,
+                )
         except Exception:
             self._model = None
 
@@ -105,8 +117,16 @@ class Qwen3StreamingTTS:
             await asyncio.sleep(0)
 
     def _generate_qwen3_wav(self, text: str, speaker_profile: str) -> np.ndarray:
+        speaker = "Vivian" if speaker_profile == "default" else speaker_profile
         with torch.inference_mode():
-            wavs, _sr = self._model.generate_custom_voice(text=text, speaker=speaker_profile)
+            if hasattr(self._model, "generate_custom_voice"):
+                wavs, sr = self._model.generate_custom_voice(
+                    text=text, language="Auto", speaker=speaker
+                )
+            else:
+                wavs, sr = self._model.generate(text=text)
+        if isinstance(sr, int) and sr > 0:
+            self.sample_rate = sr
         arr = np.asarray(wavs[0], dtype=np.float32)
         return np.clip(arr * 32767.0, -32768, 32767).astype("<i2")
 

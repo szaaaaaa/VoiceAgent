@@ -1,0 +1,47 @@
+{
+  "experiment_id": "REAL-4MODEL-RTX5070",
+  "dataset_version": "live_roundtrip_speech",
+  "split_hash": "n/a",
+  "model_checkpoints": {
+    "vad": "silero-vad-onnx",
+    "asr": "transformers:openai/whisper-base.en",
+    "tts": "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    "turn_adapter": "models/turn_adapter/causal_gru_best.pt"
+  },
+  "hyperparameters": {
+    "dtype": "bfloat16",
+    "attn_implementation": "sdpa"
+  },
+  "metrics": {
+    "gpu": "NVIDIA GeForce RTX 5070 Laptop GPU",
+    "vad_backend": "silero-vad-onnx",
+    "asr_backend": "transformers:openai/whisper-base.en",
+    "tts_backend": "qwen3-tts-cuda-sdpa",
+    "turn_adapter_version": "causal_gru_best",
+    "total_load_s": 76.54,
+    "audio_duration_s": 6.8,
+    "tts_warm_gen_s": 34.04,
+    "tts_warm_rtf": 5.006,
+    "max_silero_vad_prob": 1.0,
+    "asr_elapsed_s": 0.283,
+    "asr_rtf": 0.0417,
+    "turn_adapter_step_ms": 32.806,
+    "target_text": "Hello, VoiceAgent is running locally on your RTX 5070.",
+    "asr_roundtrip_text": "Hello, Voice Agent is running locally on your RTX 577.",
+    "roundtrip_wer": 0.3333,
+    "roundtrip_cer": 0.0556,
+    "co_resident_peak_vram_mb": 2402.4,
+    "vram_headroom_mb_on_8gb": 5748.6
+  },
+  "bad_cases": [],
+  "conclusion": "All 4 neural models ran co-resident inside 8GB VRAM with roundtrip speech verification.",
+  "beats_baseline": true,
+  "git_commit": "bdf4b17",
+  "hardware_info": {
+    "os": "Windows 10",
+    "python": "3.11.15",
+    "torch": "2.11.0+cu128",
+    "cuda_available": true,
+    "gpu_name": "NVIDIA GeForce RTX 5070 Laptop GPU"
+  }
+}

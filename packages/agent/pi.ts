@@ -4,6 +4,7 @@
  * separately from raw UI output, and enforces guarded tool execution + AbortController cancel.
  */
 
+import { spawn } from "node:child_process";
 import { type AgentHistoryMessage, PlaybackAwareHistory } from "@voice-agent/interaction";
 import { SentenceBuffer, type SentenceSegment } from "@voice-agent/speech";
 import type { ApprovalPromptHandler, PermissionGatekeeper, ToolRiskLevel } from "./permissions.js";
@@ -40,6 +41,53 @@ export interface TurnExecutionCallbacks {
   onSpeakableSentence?: (segment: SentenceSegment) => void;
   onToolStart?: (call: LlmToolRequest, riskLevel: ToolRiskLevel) => void;
   onToolEnd?: (call: LlmToolRequest, status: "ok" | "error" | "denied", output: string, durationMs: number) => void;
+}
+
+/**
+ * Bridges directly into the user's locally installed `pi` CLI (`pi 1.4+`) in non-interactive mode,
+ * reusing local `~/.pi/agent` auth/model settings while killing the subprocess immediately on barge-in.
+ */
+export function createPiCliProvider(options: { piExecutable?: string } = {}): LlmStreamProvider {
+  const piExe = options.piExecutable ?? (process.platform === "win32" ? "pi.cmd" : "pi");
+  return async function* (req: LlmStreamRequest): AsyncIterable<LlmStreamEvent> {
+    const toolsFlag = req.allowExternalTools ? "read,grep,find,ls" : "";
+    const prompt = req.messages.map((m) => `${m.role}: ${m.content}`).join("\n");
+    const args = [
+      "-p",
+      "--no-session",
+      "--no-mcp",
+      "--no-extensions",
+      "--no-approve",
+      "--thinking",
+      "off",
+      ...(toolsFlag ? ["--tools", toolsFlag] : ["--no-tools"]),
+      "--append-system-prompt",
+      "You are VoiceAgent. Reply concisely in natural spoken sentences.",
+      prompt,
+    ];
+
+    const proc = spawn(piExe, args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      shell: process.platform === "win32",
+    });
+
+    const onAbort = (): void => {
+      if (!proc.killed) proc.kill();
+    };
+    req.signal.addEventListener("abort", onAbort, { once: true });
+
+    try {
+      for await (const chunk of proc.stdout) {
+        if (req.signal.aborted) break;
+        const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
+        if (text) yield { type: "delta", text };
+      }
+    } finally {
+      req.signal.removeEventListener("abort", onAbort);
+      if (!proc.killed) proc.kill();
+    }
+  };
 }
 
 /**

@@ -9,9 +9,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from inference.protocol import (
     EventEnvelope,
@@ -23,9 +26,96 @@ from inference.protocol import (
 from inference.runtime_manager import InferenceRuntimeManager
 
 
+class AgentTurnRequest(BaseModel):
+    session_id: str
+    turn_id: str
+    user_text: str
+    history: list[dict[str, Any]] = []
+    agent_mode: str = "conversation"
+    permission_level: str = "ask"
+
+
+async def _run_pi_turn(req: AgentTurnRequest) -> dict[str, Any]:
+    """Bridges live GUI turns to the locally installed `pi` CLI with low-latency --thinking off."""
+    launcher = os.path.join(os.path.expanduser("~"), ".pi", "agent", "bin", "pi-launcher.js")
+    node_exe = shutil.which("node")
+    pi_exe = shutil.which("pi")
+    if os.getenv("VOICE_AGENT_DISABLE_PI_CLI") == "1" or (
+        not (node_exe and os.path.exists(launcher)) and not pi_exe
+    ):
+        return {
+            "reply": f"VoiceAgent received: {req.user_text}",
+            "tool_calls": [],
+            "pending_approval": None,
+        }
+
+    tools_flag = "read,grep,find,ls"
+    if req.agent_mode == "action" and req.permission_level == "trusted":
+        tools_flag = "read,grep,find,ls,write,edit"
+
+    context_lines = [
+        f"{m.get('role', 'user')}: {m.get('content', '')}" for m in req.history[-8:]
+    ]
+    prompt = "\n".join(context_lines) if context_lines else req.user_text
+    model_override = os.getenv("VOICE_AGENT_PI_MODEL")
+    cmd = (
+        [node_exe, launcher]
+        if (node_exe and os.path.exists(launcher))
+        else [pi_exe or "pi"]
+    )
+    pi_args = [
+        "-p",
+        "--no-session",
+        "--no-mcp",
+        "--no-extensions",
+        "--no-approve",
+        "--thinking",
+        "off",
+        "--tools",
+        tools_flag,
+        *(["--model", model_override] if model_override else []),
+        "--append-system-prompt",
+        (
+            "You are VoiceAgent, a concise spoken voice assistant. "
+            "Respond in clear natural sentences suitable for speech."
+        ),
+        prompt,
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        *pi_args,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=12.0)
+    except TimeoutError:
+        proc.kill()
+        return {
+            "reply": (
+                f"Pi Agent timed out. Local voice pipeline received: {req.user_text}"
+            ),
+            "tool_calls": [],
+            "pending_approval": None,
+        }
+
+    reply = stdout_b.decode("utf-8", errors="replace").strip()
+    if not reply:
+        err = stderr_b.decode("utf-8", errors="replace").strip()
+        reply = f"Pi Agent returned no text ({err[:160]})." if err else "I did not receive a reply."
+    return {"reply": reply, "tool_calls": [], "pending_approval": None}
+
+
 def create_app(manager: InferenceRuntimeManager | None = None) -> FastAPI:
     runtime = manager or InferenceRuntimeManager()
     app = FastAPI(title="VoiceAgent Local Inference Server", version="0.1.0")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.state.runtime = runtime
 
     @app.get("/health")
@@ -39,6 +129,10 @@ def create_app(manager: InferenceRuntimeManager | None = None) -> FastAPI:
     @app.get("/models")
     async def models() -> dict[str, Any]:
         return runtime.models_info()
+
+    @app.post("/api/agent/turn")
+    async def api_agent_turn(req: AgentTurnRequest) -> dict[str, Any]:
+        return await _run_pi_turn(req)
 
     @app.websocket("/ws/v1/voice")
     async def voice_ws(ws: WebSocket) -> None:

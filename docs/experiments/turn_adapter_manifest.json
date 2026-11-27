@@ -1,0 +1,143 @@
+{
+  "experiment_id": "TURN-SUITE-V1",
+  "dataset_version": "synthetic_causal_n160",
+  "split_hash": "sha256_session_70_15_15",
+  "model_checkpoints": {
+    "turn_adapter": "models\\turn_adapter\\causal_gru_best.pt"
+  },
+  "hyperparameters": {
+    "epochs": 14,
+    "device": "cuda"
+  },
+  "metrics": {
+    "dataset": "synthetic_causal_n160",
+    "device": "cuda",
+    "table1_methods": [
+      {
+        "method": "Fixed Silence (700ms)",
+        "eot_f1": 0.14286,
+        "eot_recall": 0.14286,
+        "false_cutoff_rate": 0.16575,
+        "false_interruption_rate": 0.06046,
+        "backchannel_false_cancel_rate": 1.0,
+        "decision_latency_ms": 80.0,
+        "step_compute_ms": 0.0011
+      },
+      {
+        "method": "Smart Turn (Heuristic)",
+        "eot_f1": 0.31056,
+        "eot_recall": 0.35714,
+        "false_cutoff_rate": 0.18232,
+        "false_interruption_rate": 0.0,
+        "backchannel_false_cancel_rate": 0.0,
+        "decision_latency_ms": 80.0,
+        "step_compute_ms": 0.0011
+      },
+      {
+        "method": "CausalTurnGRU (2x128, Ours)",
+        "eot_f1": 0.9635,
+        "eot_recall": 0.94286,
+        "false_cutoff_rate": 0.00276,
+        "false_interruption_rate": 0.0,
+        "backchannel_false_cancel_rate": 0.0,
+        "decision_latency_ms": 80.0,
+        "step_compute_ms": 0.022
+      }
+    ],
+    "table2_features": [
+      {
+        "method": "Acoustic Log-Mel (80d) + GRU 2x128",
+        "eot_f1": 0.78261,
+        "eot_recall": 0.9,
+        "false_cutoff_rate": 0.07735,
+        "false_interruption_rate": 0.0049,
+        "backchannel_false_cancel_rate": 0.15385,
+        "decision_latency_ms": 80.0,
+        "step_compute_ms": 0.0227
+      },
+      {
+        "method": "ASR Encoder Features (128d) + GRU 2x128",
+        "eot_f1": 0.9635,
+        "eot_recall": 0.94286,
+        "false_cutoff_rate": 0.00276,
+        "false_interruption_rate": 0.0,
+        "backchannel_false_cancel_rate": 0.0,
+        "decision_latency_ms": 80.0,
+        "step_compute_ms": 0.0256
+      }
+    ],
+    "table3_ablations": [
+      {
+        "config": "gru_L1_H64",
+        "num_layers": 1,
+        "hidden_dim": 64,
+        "params": 33862,
+        "eot_f1": 0.9635,
+        "interrupt_f1": 1.0,
+        "backchannel_f1": 1.0,
+        "causality_max_diff": 1.9e-06
+      },
+      {
+        "config": "gru_L1_H128",
+        "num_layers": 1,
+        "hidden_dim": 128,
+        "params": 116614,
+        "eot_f1": 0.9078,
+        "interrupt_f1": 1.0,
+        "backchannel_f1": 1.0,
+        "causality_max_diff": 2.4e-06
+      },
+      {
+        "config": "gru_L2_H64",
+        "num_layers": 2,
+        "hidden_dim": 64,
+        "params": 58822,
+        "eot_f1": 0.9855,
+        "interrupt_f1": 1.0,
+        "backchannel_f1": 1.0,
+        "causality_max_diff": 2.4e-06
+      },
+      {
+        "config": "gru_L2_H128",
+        "num_layers": 2,
+        "hidden_dim": 128,
+        "params": 215686,
+        "eot_f1": 0.9635,
+        "interrupt_f1": 1.0,
+        "backchannel_f1": 1.0,
+        "causality_max_diff": 3.2e-06
+      },
+      {
+        "config": "gru_L2_H256",
+        "num_layers": 2,
+        "hidden_dim": 256,
+        "params": 824326,
+        "eot_f1": 0.8951,
+        "interrupt_f1": 1.0,
+        "backchannel_f1": 1.0,
+        "causality_max_diff": 1.9e-06
+      },
+      {
+        "config": "gru_L3_H128",
+        "num_layers": 3,
+        "hidden_dim": 128,
+        "params": 314758,
+        "eot_f1": 0.9857,
+        "interrupt_f1": 1.0,
+        "backchannel_f1": 1.0,
+        "causality_max_diff": 2.4e-06
+      }
+    ]
+  },
+  "bad_cases": [],
+  "conclusion": "CausalTurnGRU outperformed Fixed Silence & Smart Turn on identical session splits.",
+  "beats_baseline": true,
+  "git_commit": "bdf4b17",
+  "hardware_info": {
+    "os": "Windows 10",
+    "python": "3.11.15",
+    "torch": "2.11.0+cu128",
+    "cuda_available": true,
+    "gpu_name": "NVIDIA GeForce RTX 5070 Laptop GPU"
+  }
+}

@@ -14,33 +14,52 @@ from inference.asr.base import ASRStepOutput, FeatureSource, StreamingEncoderCac
 
 
 class StreamingVAD:
-    """Silero VAD v5 wrapper with lightweight energy/ZCR fallback for offline environments."""
+    """Silero VAD v5/v6 wrapper with 512-sample sliding window and offline fallback."""
 
-    def __init__(self, sample_rate: int = 16000, use_silero: bool = False) -> None:
+    def __init__(self, sample_rate: int = 16000, use_silero: bool = True) -> None:
         self.sample_rate = sample_rate
+        self.backend_name = "heuristic"
         self._silero_model: Any = None
+        self._window = np.zeros(512, dtype=np.float32)
         if use_silero:
             try:
                 from silero_vad import load_silero_vad  # type: ignore[import-not-found]
 
-                self._silero_model = load_silero_vad()
+                self._silero_model = load_silero_vad(onnx=True)
+                self.backend_name = "silero-vad-onnx"
             except Exception:
-                self._silero_model = None
+                try:
+                    from silero_vad import load_silero_vad  # type: ignore[import-not-found]
+
+                    self._silero_model = load_silero_vad(onnx=False)
+                    self.backend_name = "silero-vad-torch"
+                except Exception:
+                    self._silero_model = None
+
+    def reset(self) -> None:
+        self._window.fill(0.0)
+        if self._silero_model is not None and hasattr(self._silero_model, "reset_states"):
+            self._silero_model.reset_states()
 
     def score_frame(self, pcm_16k: np.ndarray) -> float:
         if pcm_16k.size == 0:
             return 0.0
         audio_f32 = pcm_16k.astype(np.float32) / 32768.0
-        if self._silero_model is not None and audio_f32.size >= 512:
+        if self._silero_model is not None:
+            if audio_f32.size >= 512:
+                self._window = audio_f32[-512:].copy()
+            else:
+                shift = audio_f32.size
+                self._window[:-shift] = self._window[shift:]
+                self._window[-shift:] = audio_f32
             with torch.inference_mode():
-                tensor = torch.from_numpy(audio_f32[-512:])
+                tensor = torch.from_numpy(self._window)
                 return float(self._silero_model(tensor, self.sample_rate).item())
 
         # shortcut: calibrated RMS + zero-crossing heuristic when silero_vad package is absent;
-        # enable `use_silero=True` after installing `[inference]` optional extras.
+        # real neural Silero VAD activates automatically once `silero-vad` is installed.
         rms = float(np.sqrt(np.mean(audio_f32 * audio_f32) + 1e-12))
         zcr = float(np.mean(np.abs(np.diff(np.signbit(audio_f32)))))
-        # Speech typically sits above -42 dBFS with moderate zero-crossing rate (0.02..0.35).
         energy_score = np.clip((rms - 0.008) / 0.045, 0.0, 1.0)
         zcr_penalty = 0.55 if zcr > 0.45 else 1.0
         return float(np.clip(energy_score * zcr_penalty, 0.0, 1.0))
@@ -52,6 +71,9 @@ class _SessionASRState:
     accumulated_samples: int = 0
     speech_chunks: int = 0
     last_partial: str = ""
+    step_count: int = 0
+    previous_hypotheses: Any = None
+    previous_pred_out: Any = None
     encoder_cache: StreamingEncoderCache = field(default_factory=StreamingEncoderCache)
 
 
@@ -82,18 +104,51 @@ class NemotronStreamingASR:
         self.checkpoint_path: str | None = None
         self._sessions: dict[str, _SessionASRState] = {}
         self._nemo_model: Any = None
+        self._hf_asr_model: Any = None
+        self._hf_asr_processor: Any = None
+        self.active_backend = "offline-spectral"
         self._encoder_hook_outputs: list[torch.Tensor] = []
 
         if load_heavy_model or os.getenv("VOICE_AGENT_LOAD_HEAVY_MODELS") == "1":
             self._try_load_nemo(model_id)
+            if self._nemo_model is None:
+                self._try_load_hf_whisper()
+
+    def _try_load_hf_whisper(self, model_ref: str | None = None) -> None:
+        """Loads lightweight CUDA BF16 Whisper via already-installed transformers when NeMo is absent."""
+        repo: str = model_ref or os.getenv("VOICE_AGENT_HF_ASR_MODEL") or "openai/whisper-base.en"
+        try:
+            from transformers import (  # type: ignore[import-untyped]
+                AutoModelForSpeechSeq2Seq,
+                AutoProcessor,
+            )
+
+            dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
+            self._hf_asr_processor = AutoProcessor.from_pretrained(repo)
+            self._hf_asr_model = (
+                AutoModelForSpeechSeq2Seq.from_pretrained(repo, dtype=dtype)
+                .to(self.device)
+                .eval()
+            )
+            self.active_backend = f"transformers:{repo}"
+        except Exception:
+            self._hf_asr_model = None
+            self._hf_asr_processor = None
 
     def _try_load_nemo(self, model_ref: str) -> None:
         try:
             import nemo.collections.asr as nemo_asr  # type: ignore[import-not-found]
 
+            dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
             model = nemo_asr.models.ASRModel.from_pretrained(model_name=model_ref)
-            model = model.to(self.device).eval()
+            model = model.to(device=self.device, dtype=dtype).eval()
+            if hasattr(model, "encoder") and hasattr(model.encoder, "set_default_att_context_size"):
+                lookahead = 0 if self.chunk_size_ms <= 80 else 1 if self.chunk_size_ms <= 160 else 3
+                model.encoder.set_default_att_context_size([70, lookahead])
+                if hasattr(model.encoder, "setup_streaming_params"):
+                    model.encoder.setup_streaming_params()
             self._nemo_model = model
+            self.active_backend = f"nemo:{model_ref}"
             self._register_encoder_hooks()
         except Exception:
             self._nemo_model = None
@@ -150,6 +205,13 @@ class NemotronStreamingASR:
         partial = state.last_partial
         if self._nemo_model is not None and state.accumulated_samples >= self.chunk_samples:
             partial = self._run_nemo_streaming_step(state)
+        elif (
+            self._hf_asr_model is not None
+            and is_speech
+            and state.accumulated_samples >= 16000 // 2
+            and state.speech_chunks % 4 == 0
+        ):
+            partial = self._run_hf_whisper_step(state, extract_features=extract_features)
 
         taps: torch.Tensor | None = None
         active_source: FeatureSource = self.feature_source
@@ -162,9 +224,14 @@ class NemotronStreamingASR:
                 active_source = "acoustic_logmel"
                 taps = self._extract_causal_features(samples)
 
-        if self._nemo_model is None and is_speech and state.speech_chunks >= 3:
-            # shortcut: deterministic offline placeholder when NeMo weights are not loaded;
-            # real transcription activates automatically when Nemotron weights are installed.
+        if (
+            self._nemo_model is None
+            and self._hf_asr_model is None
+            and is_speech
+            and state.speech_chunks >= 3
+        ):
+            # shortcut: deterministic offline placeholder when NeMo/Whisper weights are not loaded;
+            # real GPU transcription activates when VOICE_AGENT_LOAD_HEAVY_MODELS=1.
             partial = f"[speech_stream_{state.speech_chunks}]"
 
         state.last_partial = partial
@@ -180,6 +247,8 @@ class NemotronStreamingASR:
     def finalize_utterance(self, session_id: str) -> ASRStepOutput:
         t0 = time.perf_counter()
         state = self._sessions.get(session_id)
+        if state is not None and self._hf_asr_model is not None and state.accumulated_samples > 0:
+            state.last_partial = self._run_hf_whisper_step(state, extract_features=False)
         text = state.last_partial if state else ""
         if state is not None:
             state.buffer.clear()
@@ -193,6 +262,29 @@ class NemotronStreamingASR:
             encoder_taps=None,
             compute_time_ms=elapsed_ms,
         )
+
+    def _run_hf_whisper_step(
+        self, state: _SessionASRState, *, extract_features: bool = True
+    ) -> str:
+        if self._hf_asr_model is None or self._hf_asr_processor is None:
+            return state.last_partial
+        audio = np.concatenate(state.buffer).astype(np.float32) / 32768.0
+        dtype = next(self._hf_asr_model.parameters()).dtype
+        inputs = self._hf_asr_processor(audio, sampling_rate=16000, return_tensors="pt")
+        input_features = inputs.input_features.to(device=self.device, dtype=dtype)
+        with torch.inference_mode():
+            if extract_features:
+                enc_out = self._hf_asr_model.model.encoder(
+                    input_features, output_hidden_states=True
+                )
+                hidden_states = enc_out.hidden_states
+                if hidden_states and len(hidden_states) >= 2:
+                    mid = hidden_states[len(hidden_states) // 2][:, -1:, :].float()
+                    top = hidden_states[-1][:, -1:, :].float()
+                    self._encoder_hook_outputs = [mid, top]
+            pred_ids = self._hf_asr_model.generate(input_features, max_new_tokens=64)
+        decoded = self._hf_asr_processor.batch_decode(pred_ids, skip_special_tokens=True)
+        return str(decoded[0]).strip() if decoded else state.last_partial
 
     def _extract_causal_features(self, pcm_16k: np.ndarray) -> torch.Tensor:
         """
@@ -215,9 +307,65 @@ class NemotronStreamingASR:
         if self._nemo_model is None:
             return state.last_partial
         self._encoder_hook_outputs.clear()
-        audio = np.concatenate(state.buffer).astype(np.float32) / 32768.0
+        chunk_audio = np.concatenate(state.buffer).astype(np.float32) / 32768.0
         with torch.inference_mode():
-            results = self._nemo_model.transcribe([audio], verbose=False)
+            # Prefer true O(1) cache-aware conformer_stream_step when supported by Nemotron/NeMo.
+            if hasattr(self._nemo_model, "conformer_stream_step") and hasattr(
+                self._nemo_model.encoder, "get_initial_cache_state"
+            ):
+                if state.encoder_cache.cache_last_channel is None:
+                    c_ch, c_t, c_len = self._nemo_model.encoder.get_initial_cache_state(
+                        batch_size=1
+                    )
+                    state.encoder_cache = StreamingEncoderCache(
+                        cache_last_channel=c_ch.to(self.device),
+                        cache_last_time=c_t.to(self.device),
+                        cache_last_channel_len=c_len.to(self.device),
+                    )
+                sig = torch.from_numpy(chunk_audio).unsqueeze(0).to(self.device)
+                sig_len = torch.tensor([sig.shape[1]], dtype=torch.long, device=self.device)
+                proc_sig, proc_len = self._nemo_model.preprocessor(
+                    input_signal=sig, length=sig_len
+                )
+                streaming_cfg = getattr(self._nemo_model.encoder, "streaming_cfg", None)
+                drop_extra = (
+                    getattr(streaming_cfg, "drop_extra_pre_encoded", 0)
+                    if state.step_count > 0
+                    else 0
+                )
+                (
+                    state.previous_pred_out,
+                    texts,
+                    c_ch,
+                    c_t,
+                    c_len,
+                    state.previous_hypotheses,
+                ) = self._nemo_model.conformer_stream_step(
+                    processed_signal=proc_sig,
+                    processed_signal_length=proc_len,
+                    cache_last_channel=state.encoder_cache.cache_last_channel,
+                    cache_last_time=state.encoder_cache.cache_last_time,
+                    cache_last_channel_len=state.encoder_cache.cache_last_channel_len,
+                    keep_all_outputs=False,
+                    previous_hypotheses=state.previous_hypotheses,
+                    previous_pred_out=state.previous_pred_out,
+                    drop_extra_pre_encoded=drop_extra,
+                    return_transcription=True,
+                )
+                state.encoder_cache = StreamingEncoderCache(
+                    cache_last_channel=c_ch,
+                    cache_last_time=c_t,
+                    cache_last_channel_len=c_len,
+                )
+                state.step_count += 1
+                state.buffer.clear()
+                state.accumulated_samples = 0
+                if texts:
+                    first = texts[0]
+                    return first.text if hasattr(first, "text") else str(first)
+                return state.last_partial
+
+            results = self._nemo_model.transcribe([chunk_audio], verbose=False)
         if not results:
             return state.last_partial
         first = results[0]

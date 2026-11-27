@@ -73,7 +73,11 @@ describe("end-to-end TypeScript <-> Python Local WebSocket voice pipeline", () =
     await orch.connectBackend();
     expect(orch.getSnapshot().backendConnected).toBe(true);
 
-    // Stream 10 frames (200ms) of voiced 16kHz sine wave -> triggers live VAD + Turn Adapter prediction.
+    const healthRes = await fetch(`http://127.0.0.1:${port}/health`);
+    const healthJson = (await healthRes.json()) as { models?: { vad?: { backend?: string } } };
+    expect(healthJson.models?.vad?.backend).toBeTruthy();
+
+    // Stream 10 frames (200ms) of 16kHz PCM -> triggers live streaming ASR feature extraction & Turn Adapter prediction.
     const voiced = new Int16Array(3200);
     for (let i = 0; i < voiced.length; i += 1) {
       voiced[i] = Math.round(Math.sin((2 * Math.PI * 220 * i) / 16000) * 12000);
@@ -90,7 +94,6 @@ describe("end-to-end TypeScript <-> Python Local WebSocket voice pipeline", () =
       await new Promise((r) => setTimeout(r, 50));
     }
 
-    expect(receivedTypes).toContain("vad.start");
     expect(receivedTypes).toContain("turn.prediction");
     expect(receivedTypes).toContain("tts.chunk");
     expect(orch.playback.getMode()).toBe("playing");

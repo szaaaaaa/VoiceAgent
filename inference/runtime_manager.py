@@ -123,7 +123,12 @@ class InferenceRuntimeManager:
 
     def models_info(self) -> dict[str, Any]:
         return {
-            "asr": {"model_id": self.asr.model_id, "checkpoint": self.asr.checkpoint_path},
+            "vad": {"backend": self.vad.backend_name},
+            "asr": {
+                "model_id": self.asr.model_id,
+                "backend": self.asr.active_backend,
+                "checkpoint": self.asr.checkpoint_path,
+            },
             "turn_adapter": {
                 "version": self.turn_adapter.adapter_version,
                 "checkpoint": self.turn_adapter.checkpoint_path,
@@ -131,6 +136,7 @@ class InferenceRuntimeManager:
             },
             "tts": {
                 "model_id": self.tts.model_id,
+                "backend": "qwen3-tts-cuda" if self.tts._model is not None else "offline-harmonic",
                 "sample_rate": self.tts.sample_rate,
                 "checkpoint": self.tts.checkpoint_path,
             },

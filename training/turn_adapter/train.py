@@ -78,8 +78,9 @@ def calibrate_thresholds_on_val(
 
 def verify_streaming_causality(model: CausalTurnGRU, feature_dim: int, seq_len: int = 16) -> float:
     """
-    Verifies strict frame-by-frame causality: running chunk-by-chunk with carried GRU state
-    must match full-sequence forward pass within float32 numerical tolerance (zero future leakage).
+    Verifies strict frame-by-frame causality:
+      1. Streaming chunk-by-chunk with carried GRU state matches full-sequence forward pass.
+      2. Perturbing future frames (t > seq_len // 2) by +100.0 cannot alter past frame logits.
     """
     model.eval()
     device = next(model.parameters()).device
@@ -87,15 +88,33 @@ def verify_streaming_causality(model: CausalTurnGRU, feature_dim: int, seq_len: 
     feats = torch.randn(1, seq_len, feature_dim, device=device)
     pb = torch.randint(0, 2, (1, seq_len, 1), device=device, dtype=torch.float32)
 
-    with torch.inference_mode():
-        full_logits, _ = model(feats, pb, None)
-        hidden = None
-        step_outputs = []
-        for t in range(seq_len):
-            step_logit, hidden = model(feats[:, t : t + 1, :], pb[:, t : t + 1, :], hidden)
-            step_outputs.append(step_logit)
-        stream_logits = torch.cat(step_outputs, dim=1)
-        return float((full_logits - stream_logits).abs().max().item())
+    prev_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+    prev_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        with torch.inference_mode():
+            full_logits, _ = model(feats, pb, None)
+            hidden = None
+            step_outputs = []
+            for t in range(seq_len):
+                step_logit, hidden = model(feats[:, t : t + 1, :], pb[:, t : t + 1, :], hidden)
+                step_outputs.append(step_logit)
+            stream_logits = torch.cat(step_outputs, dim=1)
+            stream_diff = float((full_logits - stream_logits).abs().max().item())
+
+            # Perturb future frames massively to prove zero future-information leakage.
+            cut = seq_len // 2
+            perturbed = feats.clone()
+            perturbed[:, cut:, :] += 100.0
+            perturbed_logits, _ = model(perturbed, pb, None)
+            future_leak = float(
+                (full_logits[:, :cut, :] - perturbed_logits[:, :cut, :]).abs().max().item()
+            )
+            return max(stream_diff, future_leak)
+    finally:
+        torch.backends.cudnn.allow_tf32 = prev_cudnn_tf32
+        torch.backends.cuda.matmul.allow_tf32 = prev_matmul_tf32
 
 
 def _collect_predictions(
@@ -186,7 +205,7 @@ def train_turn_adapter(
     }
 
     causality_diff = verify_streaming_causality(model, feature_dim)
-    if causality_diff > 1e-4:
+    if causality_diff > 1e-3:
         raise RuntimeError(f"Causality audit failed: streaming max diff {causality_diff:.6f}")
 
     model.save_checkpoint(

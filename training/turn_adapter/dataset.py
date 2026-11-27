@@ -71,38 +71,63 @@ def generate_synthetic_turn_dataset(
     seed: int = 42,
 ) -> list[TurnSessionSample]:
     """
-    Generates causal synthetic turn-taking sequences mimicking Voice-Light interaction semantics:
-      - EOT completion at end of user utterance after brief trailing drop in speech energy
-      - Active floor-taking interruption during assistant playback (sustained high energy)
-      - Non-floor backchannel during assistant playback (brief localized energy bump)
+    Generates realistic causal turn-taking sequences with 4 distinct regimes:
+      0) True EOT: user speaks (high acoustic + completion semantic cue), then drops to true silence.
+      1) Mid-utterance HOLD pause: user pauses briefly (true low-energy silence, 4-8 frames) with
+         unfinished semantic cue, then resumes speaking (tests false-cutoff resistance!).
+      2) Active floor-taking interruption during assistant playback (sustained speech > 600ms).
+      3) Short non-floor backchannel during assistant playback ("uh-huh", 3-5 frames).
     """
     rng = np.random.default_rng(seed)
     samples: list[TurnSessionSample] = []
 
     for i in range(num_sessions):
-        feats = rng.normal(0.0, 0.25, size=(seq_len, feature_dim)).astype(np.float32)
+        # Ambient silence floor has low magnitude (~0.08) so energy-based baselines work honestly.
+        feats = rng.normal(0.0, 0.08, size=(seq_len, feature_dim)).astype(np.float32)
         playback = np.zeros((seq_len, 1), dtype=np.float32)
         labels = np.zeros((seq_len, 3), dtype=np.float32)
 
-        mode = i % 3
+        mode = i % 4
         if mode == 0:
-            # User speaks then finishes (EOT).
-            end_frame = seq_len // 2 + int(rng.integers(2, 8))
-            feats[:end_frame, :16] += 1.4
-            feats[end_frame:, :16] -= 0.8
-            labels[end_frame : min(seq_len, end_frame + 5), 0] = 1.0
+            # User speaks then cleanly finishes -> EOT during trailing silence.
+            end_frame = seq_len // 2 + int(rng.integers(-3, 5))
+            feats[:end_frame, :16] += rng.normal(0.85, 0.15, size=(end_frame, 16)).astype(np.float32)
+            # Semantic completion cues reside in upper ASR encoder dimensions (80:112).
+            if feature_dim >= 112:
+                feats[max(0, end_frame - 4) : end_frame, 80:112] += 1.1
+            labels[end_frame : min(seq_len, end_frame + 10), 0] = 1.0
         elif mode == 1:
-            # Assistant speaking; user barges in (Floor Taking).
+            # Mid-utterance hesitation HOLD pause -> silence gap should NOT trigger EOT!
+            pause_start = seq_len // 3
+            pause_len = int(rng.integers(5, 10))
+            pause_end = min(seq_len - 4, pause_start + pause_len)
+            feats[:pause_start, :16] += rng.normal(0.95, 0.18, size=(pause_start, 16)).astype(np.float32)
+            if feature_dim >= 112:
+                # Semantic "unfinished/hesitation" cue in upper encoder dims.
+                feats[max(0, pause_start - 4) : pause_start, 80:112] -= 1.1
+            feats[pause_end : seq_len - 5, :16] += rng.normal(0.85, 0.15, size=(seq_len - 5 - pause_end, 16)).astype(np.float32)
+            if feature_dim >= 112:
+                feats[seq_len - 8 : seq_len - 5, 80:112] += 1.1
+            labels[seq_len - 5 :, 0] = 1.0
+        elif mode == 2:
+            # Assistant speaking; user barges in (sustained Floor Taking).
             playback[:, 0] = 1.0
             barge_start = seq_len // 3
-            feats[barge_start : barge_start + 14, 16:32] += 1.8
-            labels[barge_start + 2 : barge_start + 14, 1] = 1.0
+            barge_end = min(seq_len, barge_start + 14)
+            feats[barge_start:barge_end, :16] += rng.normal(0.95, 0.18, size=(barge_end - barge_start, 16)).astype(np.float32)
+            if feature_dim >= 128:
+                feats[barge_start:barge_end, 96:128] += 1.2
+            labels[barge_start + 2 : barge_end, 1] = 1.0
         else:
-            # Assistant speaking; user gives brief backchannel ("uh-huh").
+            # Assistant speaking; user gives brief backchannel ("uh-huh", 3-5 frames).
             playback[:, 0] = 1.0
             bc_start = seq_len // 2
-            feats[bc_start : bc_start + 4, 32:48] += 1.5
-            labels[bc_start + 1 : bc_start + 4, 2] = 1.0
+            bc_len = int(rng.integers(3, 6))
+            bc_end = min(seq_len, bc_start + bc_len)
+            feats[bc_start:bc_end, :16] += rng.normal(0.75, 0.15, size=(bc_end - bc_start, 16)).astype(np.float32)
+            if feature_dim >= 128:
+                feats[bc_start:bc_end, 96:128] -= 1.0
+            labels[bc_start + 1 : bc_end, 2] = 1.0
 
         samples.append(
             TurnSessionSample(

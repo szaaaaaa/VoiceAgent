@@ -13,7 +13,10 @@
     "node": ">=22.0.0"
   },
   "scripts": {
-    "dev": "npm --workspace=@voice-agent/desktop run dev",
+    "dev": "vite --config apps/desktop/vite.config.ts",
+    "gui": "vite --config apps/desktop/vite.config.ts",
+    "desktop": "electron apps/desktop/electron-main.cjs",
+    "build:gui": "vite build --config apps/desktop/vite.config.ts",
     "build": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
@@ -27,6 +30,8 @@
     "@types/react": "^19.0.10",
     "@types/react-dom": "^19.0.4",
     "@types/ws": "^8.18.0",
+    "@vitejs/plugin-react": "^4.7.0",
+    "electron": "^45.5.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "typescript": "^5.8.2",

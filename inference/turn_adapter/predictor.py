@@ -59,7 +59,8 @@ class TurnAdapterPredictor:
         assistant_speaking: bool,
     ) -> TurnAdapterPrediction:
         t0 = time.perf_counter()
-        feats = encoder_taps.to(device=self.device, dtype=torch.float32)
+        model_dtype = next(self.model.parameters()).dtype
+        feats = encoder_taps.to(device=self.device, dtype=model_dtype)
         if feats.ndim == 2:
             feats = feats.unsqueeze(0)
         batch, seq_len, _ = feats.shape
@@ -67,13 +68,13 @@ class TurnAdapterPredictor:
             (batch, seq_len, 1),
             1.0 if assistant_speaking else 0.0,
             device=self.device,
-            dtype=torch.float32,
+            dtype=model_dtype,
         )
         prev_hidden = self._states.get(session_id)
 
         with torch.inference_mode():
             logits, next_hidden = self.model(feats, playback_tensor, prev_hidden)
-            probs = torch.sigmoid(logits[:, -1, :]).squeeze(0).cpu().tolist()
+            probs = torch.sigmoid(logits[:, -1, :].float()).squeeze(0).cpu().tolist()
 
         self._states[session_id] = next_hidden.detach()
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
