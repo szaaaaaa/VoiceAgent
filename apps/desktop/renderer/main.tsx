@@ -1,3 +1,12 @@
+/**
+ * VoiceAgent R&D & Experiment Observation Workbench (V2.0).
+ * Four focused views wired to the local Python speech core (127.0.0.1:8765):
+ *  1. 实时信号示波台 (Observer mode watching live Pi /voice sessions + Sandbox mic/WAV injector)
+ *  2. 模型热插拔注册表 (models/registry.json hot-swap & turn strategy switch)
+ *  3. A/B 盲测实验台 (ASR multi-checkpoint diff/WER + TTS blind MOS evaluation & CSV export)
+ *  4. 实验报告与 Bad Case 回放 (docs/experiments/ viewer + 20ms streaming audio replay)
+ */
+
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
@@ -7,15 +16,29 @@ import {
   GenerationTracker,
   parseEventEnvelope,
   StreamKind,
+  type ClientRole,
+  type EventPayloadMap,
+  type RegistrySnapshotResponse,
 } from "@voice-agent/protocol";
+import { computeRmsDb } from "@voice-agent/audio";
+import { BrowserMicCapture, BrowserStreamPlayer } from "./audio-io";
+import { ScopeCanvas, type TelemetryPoint } from "./ScopeCanvas";
 import {
-  HybridTurnManager,
-  PlaybackAwareHistory,
-  type TurnAdapterProbabilities,
-  type TurnStrategy,
-} from "@voice-agent/interaction";
-import { SentenceBuffer } from "@voice-agent/speech";
-import { BrowserMicCapture, BrowserStreamPlayer, listAudioDevices, type AudioDeviceOption } from "./audio-io";
+  activateRegistryModel,
+  decodeAudioFileToPcm16k,
+  encodePcm16kToWavBase64,
+  fetchExperiments,
+  fetchHealth,
+  fetchRegistry,
+  formatCsvRows,
+  makeSyntheticProbeWavBase64,
+  runAbAsr,
+  runAbTts,
+  type AbAsrResponse,
+  type AbTtsResponse,
+  type ExperimentsResponse,
+  type HealthSnapshot,
+} from "./workbench-api";
 
 interface DesktopPreloadApi {
   isElectron: boolean;
@@ -38,133 +61,148 @@ declare global {
   }
 }
 
-interface HealthInfo {
-  status: string;
-  vram: { device: string; allocated_mb: number; reserved_mb: number; total_mb: number };
-  models: {
-    vad?: { backend: string };
-    asr: { model_id: string; backend?: string; checkpoint: string | null };
-    turn_adapter: { version: string; params: number };
-    tts: { model_id: string; backend?: string; sample_rate: number };
-  };
-}
+type WorkbenchTab = "scope" | "registry" | "ab_lab" | "experiments";
 
-interface PendingApprovalUi {
-  approvalId: string;
-  toolName: string;
-  impactSummary: string;
-  targetPath: string | null;
-  command: string | null;
+interface LiveEventEntry {
+  id: number;
+  ts: string;
+  type: string;
+  summary: string;
 }
-
-type InteractionMode = "hands-free" | "push-to-talk" | "text" | "mute";
-type TtsEngineChoice = "native_voice" | "backend_pcm";
 
 const DEFAULT_WS_URL = "ws://127.0.0.1:8765/ws/v1/voice";
 const DEFAULT_API_BASE = "http://127.0.0.1:8765";
+const SCOPE_WINDOW = 90;
 
-const EXPLICIT_APPROVE = new Set(["yes", "approve", "confirm", "allow", "同意", "确认", "允许", "批准"]);
-const EXPLICIT_DENY = new Set(["no", "deny", "cancel", "stop", "不要", "拒绝", "取消"]);
-
-const MODE_LABELS: Record<InteractionMode, string> = {
-  "hands-free": "免提连续对话",
-  "push-to-talk": "按键说话",
-  text: "纯文本",
-  mute: "静音",
+const TURN_STRATEGY_LABELS: Record<string, string> = {
+  hybrid: "混合控制 (CausalGRU + 规则 + 静音兜底)",
+  adapter: "纯 CausalTurnGRU 模型",
+  smart_turn: "Smart Turn 启发式基线",
+  vad_only: "纯 Silero VAD 基线",
+  fixed_silence: "固定静音阈值 (700ms)",
 };
 
-const ASSISTANT_STATE_LABELS: Record<string, string> = {
-  idle: "空闲",
-  thinking: "思考中",
-  executing: "执行工具中",
-  speaking: "播报中",
-  interrupted: "已被打断",
-  awaiting_approval: "等待授权",
-  error: "异常",
-};
+function makeEmptyScope(): TelemetryPoint[] {
+  return Array.from({ length: SCOPE_WINDOW }, () => ({
+    rmsDb: -90,
+    vadProb: 0,
+    pCompletion: 0,
+    pFloorTaking: 0,
+    pBackchannel: 0,
+  }));
+}
 
-function VoiceAgentDesktop(): React.ReactElement {
+function formatTimeNow(): string {
+  const d = new Date();
+  return d.toTimeString().slice(0, 8);
+}
+
+function cardStyle(extra?: React.CSSProperties): React.CSSProperties {
+  return {
+    background: "#111827",
+    border: "1px solid #1f2937",
+    borderRadius: 10,
+    padding: 14,
+    ...extra,
+  };
+}
+
+function btnStyle(active = false, tone: "blue" | "green" | "red" | "gray" = "blue"): React.CSSProperties {
+  const palette = {
+    blue: active ? "#2563eb" : "#1e293b",
+    green: active ? "#059669" : "#1e293b",
+    red: active ? "#dc2626" : "#1e293b",
+    gray: "#1f2937",
+  };
+  return {
+    background: palette[tone],
+    border: "1px solid #334155",
+    borderRadius: 6,
+    padding: "6px 12px",
+    cursor: "pointer",
+    fontSize: 12,
+    fontWeight: active ? 600 : 400,
+  };
+}
+
+function VoiceWorkbench(): React.ReactElement {
   const [wsUrl, setWsUrl] = useState(DEFAULT_WS_URL);
   const [apiBase, setApiBase] = useState(DEFAULT_API_BASE);
+  const [activeTab, setActiveTab] = useState<WorkbenchTab>("scope");
+  const [clientRole, setClientRole] = useState<ClientRole>("observer");
+  const [wsConnected, setWsConnected] = useState(false);
   const [heavyGpu, setHeavyGpu] = useState(false);
   const [restartingBackend, setRestartingBackend] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
 
-  const [connected, setConnected] = useState(false);
+  const [health, setHealth] = useState<HealthSnapshot | null>(null);
+  const [registry, setRegistry] = useState<RegistrySnapshotResponse | null>(null);
+  const [experiments, setExperiments] = useState<ExperimentsResponse | null>(null);
+  const [selectedExpId, setSelectedExpId] = useState<string | null>(null);
+
+  // Live oscilloscope & telemetry state
+  const [scopePoints, setScopePoints] = useState<TelemetryPoint[]>(makeEmptyScope);
+  const [liveEvents, setLiveEvents] = useState<LiveEventEntry[]>([]);
+  const [liveTranscript, setLiveTranscript] = useState("");
+  const [cursorState, setCursorState] = useState<{ mode: string; charIdx: number; durMs: number }>({
+    mode: "idle",
+    charIdx: 0,
+    durMs: 0,
+  });
+  const [stepMs, setStepMs] = useState<number | null>(null);
   const [micActive, setMicActive] = useState(false);
-  const [pttPressed, setPttPressed] = useState(false);
-  const [mode, setMode] = useState<InteractionMode>("hands-free");
-  const [ttsEngine, setTtsEngine] = useState<TtsEngineChoice>("native_voice");
-  const [agentMode, setAgentMode] = useState<"conversation" | "action">("conversation");
-  const [permLevel, setPermLevel] = useState<"readonly" | "ask" | "trusted">("ask");
-  const [turnStrategy, setTurnStrategy] = useState<TurnStrategy>("hybrid");
-  const [assistantState, setAssistantState] = useState("idle");
-  const [partialText, setPartialText] = useState("");
-  const [vadProb, setVadProb] = useState(0);
-  const [adapterProb, setAdapterProb] = useState<TurnAdapterProbabilities | null>(null);
-  const [rmsHistory, setRmsHistory] = useState<number[]>(() => Array(56).fill(-90));
-  const [turnsVersion, setTurnsVersion] = useState(0);
-  const [textInput, setTextInput] = useState("");
-  const [devMode, setDevMode] = useState(true);
-  const [health, setHealth] = useState<HealthInfo | null>(null);
-  const [devices, setDevices] = useState<AudioDeviceOption[]>([]);
-  const [selectedMic, setSelectedMic] = useState("default");
-  const [aecEnabled, setAecEnabled] = useState(true);
-  const [lastLatencyMs, setLastLatencyMs] = useState<{ ttfa?: number; e2e?: number; bargeIn?: number }>({});
-  const [pendingApproval, setPendingApproval] = useState<PendingApprovalUi | null>(null);
-  const [statusNote, setStatusNote] = useState<string | null>(null);
+  const [sandboxTtsText, setSandboxTtsText] = useState("你好，这里是 VoiceAgent 语音算法观测工作台。");
+  const [replayingAudio, setReplayingAudio] = useState(false);
+
+  // A/B Lab state
+  const [selectedAsrIds, setSelectedAsrIds] = useState<string[]>([]);
+  const [asrRefText, setAsrRefText] = useState("");
+  const [asrAudioB64, setAsrAudioB64] = useState<string>("");
+  const [asrAudioLabel, setAsrAudioLabel] = useState<string>("未上传（默认将使用内置 1.2s 测试音）");
+  const [asrAbLoading, setAsrAbLoading] = useState(false);
+  const [asrAbResult, setAsrAbResult] = useState<AbAsrResponse | null>(null);
+
+  const [selectedTtsIds, setSelectedTtsIds] = useState<string[]>([]);
+  const [ttsPrompt, setTtsPrompt] = useState("当前四模型同卡常驻显存仅占用两千四百兆，具备充足微调余量。");
+  const [ttsBlindMode, setTtsBlindMode] = useState(true);
+  const [ttsAbLoading, setTtsAbLoading] = useState(false);
+  const [ttsAbResult, setTtsAbResult] = useState<AbTtsResponse | null>(null);
+  const [ttsRevealed, setTtsRevealed] = useState(false);
+  const [mosScores, setMosScores] = useState<Record<string, number>>({});
 
   const wsRef = useRef<WebSocket | null>(null);
   const micRef = useRef(new BrowserMicCapture());
   const playerRef = useRef(new BrowserStreamPlayer());
-  const trackerRef = useRef(new GenerationTracker(`desk_${Date.now().toString(36)}`));
-  const historyRef = useRef(new PlaybackAwareHistory());
-  const turnManagerRef = useRef(new HybridTurnManager({ strategy: "hybrid" }));
-  const pendingMetaRef = useRef(new Map<number, Array<{ charStart: number; charEnd: number; sampleRate: number }>>());
-  const audioSeqRef = useRef(0);
-  const speechEndRef = useRef(0);
-  const vadInSpeechRef = useRef(false);
-  const speechStartPtsRef = useRef(0);
-  const lastPtsRef = useRef(0);
-  const suspectedInterruptMsRef = useRef(0);
-  const modeRef = useRef<InteractionMode>(mode);
-  const pttPressedRef = useRef(pttPressed);
-  const partialTextRef = useRef(partialText);
-  const pendingApprovalRef = useRef<PendingApprovalUi | null>(pendingApproval);
-  const ttsEngineRef = useRef<TtsEngineChoice>(ttsEngine);
-  const zhVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const eventLogRef = useRef<Array<Record<string, unknown>>>([]);
+  const trackerRef = useRef(new GenerationTracker(`wb_${Date.now().toString(36)}`));
+  const pendingTtsMetaRef = useRef(new Map<number, Array<{ charStart: number; charEnd: number; sampleRate: number }>>());
+  const seqRef = useRef(0);
+  const logSeqRef = useRef(0);
+  const latestPointRef = useRef<TelemetryPoint>({
+    rmsDb: -90,
+    vadProb: 0,
+    pCompletion: 0,
+    pFloorTaking: 0,
+    pBackchannel: 0,
+  });
+  const telemetryJsonlRef = useRef<Array<Record<string, unknown>>>([]);
+  const pendingReplayRef = useRef<{ pcm16k: Int16Array; label: string } | null>(null);
+  const replayFnRef = useRef<((pcm16k: Int16Array, label: string) => Promise<void>) | null>(null);
 
-  modeRef.current = mode;
-  pttPressedRef.current = pttPressed;
-  partialTextRef.current = partialText;
-  pendingApprovalRef.current = pendingApproval;
-  ttsEngineRef.current = ttsEngine;
-
-  const pushLog = (kind: string, data: Record<string, unknown>): void => {
-    eventLogRef.current.push({ ts: Date.now(), kind, ...data });
-    if (eventLogRef.current.length > 500) eventLogRef.current.shift();
-  };
-
-  // Preload Windows Chinese TTS voice (e.g. Microsoft Huihui / Xiaoxiao) as soon as voices load.
-  useEffect(() => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
-    const pickZhVoice = () => {
-      const voices = window.speechSynthesis.getVoices();
-      zhVoiceRef.current =
-        voices.find((v) => /xiaoxiao|yunxi|yaoyao|huihui/i.test(v.name) && v.lang.toLowerCase().startsWith("zh")) ??
-        voices.find((v) => v.lang.toLowerCase().startsWith("zh-cn")) ??
-        voices.find((v) => v.lang.toLowerCase().startsWith("zh")) ??
-        null;
-    };
-    pickZhVoice();
-    window.speechSynthesis.onvoiceschanged = pickZhVoice;
-    return () => {
-      window.speechSynthesis.onvoiceschanged = null;
-    };
+  const appendEventLog = useCallback((type: string, summary: string, raw?: Record<string, unknown>) => {
+    logSeqRef.current += 1;
+    const id = logSeqRef.current;
+    setLiveEvents((prev) => [{ id, ts: formatTimeNow(), type, summary }, ...prev].slice(0, 80));
+    telemetryJsonlRef.current.push({ ts: Date.now(), type, summary, ...(raw ?? {}) });
+    if (telemetryJsonlRef.current.length > 600) telemetryJsonlRef.current.shift();
   }, []);
 
-  // Sync Electron desktop config & global Alt+Space PTT shortcut when running in Electron.
+  const pushScopePatch = useCallback((patch: Partial<TelemetryPoint>) => {
+    const next: TelemetryPoint = { ...latestPointRef.current, ...patch };
+    latestPointRef.current = next;
+    setScopePoints((prev) => [...prev.slice(1), next]);
+  }, []);
+
+  // Load Electron desktop config if running inside Electron.
   useEffect(() => {
     const bridge = window.voiceAgentDesktop;
     if (!bridge) return;
@@ -172,304 +210,47 @@ function VoiceAgentDesktop(): React.ReactElement {
       setWsUrl(cfg.wsUrl);
       setApiBase(cfg.apiBase);
       setHeavyGpu(cfg.heavyModelsEnabled);
-      if (cfg.heavyModelsEnabled) setTtsEngine("backend_pcm");
-    });
-    return bridge.onPushToTalkToggle(() => {
-      setMode("push-to-talk");
-      setPttPressed((prev) => !prev);
     });
   }, []);
 
-  // Draw live waveform bars on canvas.
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    const barW = canvas.width / rmsHistory.length;
-    rmsHistory.forEach((db, i) => {
-      const norm = Math.max(0.05, Math.min(1, (db + 75) / 65));
-      const h = norm * (canvas.height - 8);
-      ctx.fillStyle = vadProb >= 0.5 ? "#38bdf8" : mode === "push-to-talk" && pttPressed ? "#a78bfa" : "#475569";
-      ctx.fillRect(i * barW + 1.5, (canvas.height - h) / 2, Math.max(2, barW - 3), h);
-    });
-  }, [rmsHistory, vadProb, mode, pttPressed]);
-
-  // Poll backend /health every 3s.
-  useEffect(() => {
-    const poll = async () => {
-      try {
-        const res = await fetch(`${apiBase}/health`);
-        if (res.ok) setHealth((await res.json()) as HealthInfo);
-      } catch {
-        // Offline
-      }
-    };
-    void poll();
-    const id = setInterval(() => void poll(), 3000);
-    return () => clearInterval(id);
+  const refreshMetadata = useCallback(async () => {
+    try {
+      const [h, reg, exps] = await Promise.all([
+        fetchHealth(apiBase),
+        fetchRegistry(apiBase),
+        fetchExperiments(apiBase),
+      ]);
+      setHealth(h);
+      setRegistry(reg);
+      setExperiments(exps);
+      setSelectedExpId((cur) => cur ?? exps.reports[0]?.id ?? null);
+      setSelectedAsrIds((cur) =>
+        cur.length > 0
+          ? cur
+          : reg.checkpoints.filter((c) => c.model_type === "asr").slice(0, 2).map((c) => c.checkpoint_id),
+      );
+      setSelectedTtsIds((cur) =>
+        cur.length > 0
+          ? cur
+          : reg.checkpoints.filter((c) => c.model_type === "tts").slice(0, 2).map((c) => c.checkpoint_id),
+      );
+    } catch {
+      // Backend still booting or offline.
+    }
   }, [apiBase]);
 
-  const stopNativeSpeech = (): void => {
-    if (typeof window !== "undefined" && "speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-    }
-  };
-
-  const speakNativeVoice = useCallback((text: string, turnId: string): void => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window) || !text.trim()) {
-      setAssistantState("idle");
-      return;
-    }
-    window.speechSynthesis.cancel();
-    const utter = new SpeechSynthesisUtterance(text);
-    utter.lang = "zh-CN";
-    utter.rate = 1.05;
-    if (zhVoiceRef.current) {
-      utter.voice = zhVoiceRef.current;
-    } else {
-      const voices = window.speechSynthesis.getVoices();
-      const zh = voices.find((v) => v.lang.toLowerCase().startsWith("zh"));
-      if (zh) utter.voice = zh;
-    }
-    utter.onstart = () => {
-      setAssistantState("speaking");
-      if (speechEndRef.current > 0) {
-        const e2e = Math.round(performance.now() - speechEndRef.current);
-        setLastLatencyMs((prev) => ({ ...prev, ttfa: e2e, e2e }));
-        pushLog("e2e_audible", { turnId, e2eMs: e2e, engine: "native_voice_zh" });
-        speechEndRef.current = 0;
-      }
-    };
-    utter.onend = () => {
-      setAssistantState((cur) => (cur === "speaking" ? "idle" : cur));
-    };
-    utter.onerror = () => {
-      setAssistantState("idle");
-    };
-    window.speechSynthesis.speak(utter);
-  }, []);
-
-  const triggerBargeInCancel = useCallback((reason = "user_interruption"): void => {
-    stopNativeSpeech();
-    const active = trackerRef.current.cancelCurrentGeneration();
-    const cursor = playerRef.current.cancel();
-    if (suspectedInterruptMsRef.current > 0) {
-      const bargeMs = Math.round(performance.now() - suspectedInterruptMsRef.current);
-      setLastLatencyMs((prev) => ({ ...prev, bargeIn: bargeMs }));
-      pushLog("barge_in_cancel", { reason, bargeMs, playedChars: cursor.playedCharIndex });
-      suspectedInterruptMsRef.current = 0;
-    }
-    const turnId = trackerRef.current.ids.turnId;
-    if (turnId) {
-      historyRef.current.markInterrupted(turnId, cursor.playedCharIndex);
-      setTurnsVersion((v) => v + 1);
-    }
-    if (active) {
-      pendingMetaRef.current.delete(active.generationTag);
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify(
-            createEvent(
-              "generation.cancel",
-              { sessionId: trackerRef.current.ids.sessionId, turnId, generationId: active.generationId },
-              {
-                target_generation_id: active.generationId,
-                generation_tag: active.generationTag,
-                reason,
-                audible_cursor_chars: cursor.playedCharIndex,
-              },
-            ),
-          ),
-        );
-      }
-    }
-    setAssistantState("interrupted");
-  }, []);
-
-  const dispatchSpeakableReply = useCallback(
-    (turnId: string, generationId: string, generationTag: number, reply: string): void => {
-      const buf = new SentenceBuffer();
-      const segs = [...buf.pushDelta(reply), ...buf.flush()];
-      const speakable = segs.map((s) => s.text).join(" ");
-      historyRef.current.recordAssistantReply(turnId, reply, speakable);
-      setTurnsVersion((v) => v + 1);
-
-      if (ttsEngineRef.current === "native_voice") {
-        speakNativeVoice(speakable, turnId);
-        return;
-      }
-
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN && trackerRef.current.isGenerationTagActive(generationTag)) {
-        for (const seg of segs) {
-          ws.send(
-            JSON.stringify(
-              createEvent(
-                "tts.synthesize",
-                { sessionId: trackerRef.current.ids.sessionId, turnId, generationId },
-                {
-                  sentence_index: seg.sentenceIndex,
-                  text: seg.text,
-                  char_start: seg.charStart,
-                  char_end: seg.charEnd,
-                  generation_tag: generationTag,
-                  speaker_profile: "default",
-                },
-              ),
-            ),
-          );
-        }
-      } else {
-        setAssistantState("idle");
-      }
-    },
-    [speakNativeVoice],
-  );
-
-  const respondApproval = useCallback(
-    async (approved: boolean, source: "ui" | "voice", reason: string): Promise<void> => {
-      const current = pendingApprovalRef.current;
-      if (!current) return;
-      setPendingApproval(null);
-      setAssistantState("executing");
-
-      try {
-        const res = await fetch(`${apiBase}/api/agent/approval`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            approval_id: current.approvalId,
-            approved,
-            source,
-            reason,
-          }),
-        });
-        const data = (await res.json()) as {
-          reply: string;
-          tool_calls?: Array<{ id: string; name: string; status: "ok" | "denied" | "error"; output: string }>;
-        };
-        const turnId = trackerRef.current.ids.turnId ?? trackerRef.current.startTurn();
-        const { generationId, generationTag } = trackerRef.current.startGeneration();
-        for (const tc of data.tool_calls ?? []) {
-          historyRef.current.recordToolExecution(turnId, {
-            toolCallId: tc.id,
-            toolName: tc.name,
-            argsSummary: current.command ?? "{}",
-            status: tc.status,
-            sideEffectCommitted: tc.status === "ok",
-            result: tc.output,
-          });
-        }
-        dispatchSpeakableReply(turnId, generationId, generationTag, data.reply);
-      } catch (err) {
-        setStatusNote(`审批请求异常：${err instanceof Error ? err.message : String(err)}`);
-        setAssistantState("error");
-      }
-    },
-    [apiBase, dispatchSpeakableReply],
-  );
-
-  const runTurn = useCallback(
-    async (userText: string): Promise<void> => {
-      const clean = userText.trim();
-      if (!clean) return;
-
-      if (pendingApprovalRef.current) {
-        const norm = clean.toLowerCase().replace(/[.,!?;:。！？]+$/g, "");
-        if (EXPLICIT_APPROVE.has(norm)) {
-          await respondApproval(true, "voice", `语音明确确认：「${clean}」`);
-        } else if (EXPLICIT_DENY.has(norm)) {
-          await respondApproval(false, "voice", `语音明确拒绝：「${clean}」`);
-        } else {
-          await respondApproval(false, "voice", `语义不明确「${clean}」，默认拒绝`);
-        }
-        return;
-      }
-
-      speechEndRef.current = performance.now();
-      const turnId = trackerRef.current.startTurn();
-      const { generationId, generationTag } = trackerRef.current.startGeneration();
-      historyRef.current.recordUserTurn(turnId, clean);
-      setTurnsVersion((v) => v + 1);
-      setAssistantState("thinking");
-      pushLog("turn_start", { turnId, userText: clean });
-
-      try {
-        const res = await fetch(`${apiBase}/api/agent/turn`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            session_id: trackerRef.current.ids.sessionId,
-            turn_id: turnId,
-            user_text: clean,
-            history: historyRef.current.toAgentMessages(),
-            agent_mode: agentMode,
-            permission_level: permLevel,
-          }),
-        });
-        const data = (await res.json()) as {
-          reply: string;
-          tool_calls?: Array<{ id: string; name: string; status: "ok" | "denied" | "error"; output: string }>;
-          pending_approval?: PendingApprovalUi | null;
-        };
-
-        if (data.pending_approval) {
-          setPendingApproval(data.pending_approval);
-          setAssistantState("awaiting_approval");
-        }
-        for (const tc of data.tool_calls ?? []) {
-          historyRef.current.recordToolExecution(turnId, {
-            toolCallId: tc.id,
-            toolName: tc.name,
-            argsSummary: "{}",
-            status: tc.status,
-            sideEffectCommitted: tc.status === "ok",
-            result: tc.output,
-          });
-        }
-        dispatchSpeakableReply(turnId, generationId, generationTag, data.reply);
-      } catch (err) {
-        setStatusNote(`智能体请求异常：${err instanceof Error ? err.message : String(err)}`);
-        setAssistantState("error");
-      }
-    },
-    [agentMode, apiBase, dispatchSpeakableReply, permLevel, respondApproval],
-  );
-
-  const runTurnRef = useRef(runTurn);
-  runTurnRef.current = runTurn;
-
-  // Connect local WebSocket & wire audio player state.
   useEffect(() => {
-    let closed = false;
-    playerRef.current.setListener((st) => {
-      if (st.mode === "playing") {
-        setAssistantState("speaking");
-        if (speechEndRef.current > 0) {
-          const e2e = Math.round(performance.now() - speechEndRef.current);
-          setLastLatencyMs((prev) => ({ ...prev, e2e }));
-          pushLog("e2e_audible", { e2eMs: e2e, engine: "backend_pcm" });
-          speechEndRef.current = 0;
-        }
-      } else if (st.mode === "idle") {
-        setAssistantState((cur) => (cur === "speaking" ? "idle" : cur));
-      }
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify(
-            createEvent("playback.ack", trackerRef.current.ids, {
-              playback_state: st.mode,
-              played_char_index: st.playedCharIndex,
-              played_duration_ms: st.playedDurationMs,
-            }),
-          ),
-        );
-      }
-    });
+    void refreshMetadata();
+    const id = setInterval(() => {
+      void fetchHealth(apiBase).then(setHealth).catch(() => {});
+    }, 3000);
+    return () => clearInterval(id);
+  }, [apiBase, refreshMetadata]);
+
+  // Connect WebSocket in either `observer` (watches live Pi /voice) or `controller` (sandbox) mode.
+  useEffect(() => {
+    let disposed = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     const connect = () => {
       const ws = new WebSocket(wsUrl);
@@ -477,22 +258,34 @@ function VoiceAgentDesktop(): React.ReactElement {
       wsRef.current = ws;
 
       ws.onopen = () => {
-        setConnected(true);
-        setStatusNote(null);
+        setWsConnected(true);
         ws.send(
           JSON.stringify(
-            createEvent("session.init", { sessionId: trackerRef.current.ids.sessionId }, { sample_rate: 16000 }),
+            createEvent(
+              "session.init",
+              { sessionId: trackerRef.current.ids.sessionId },
+              {
+                sample_rate: 16000,
+                role: clientRole,
+                audio_mode: "ws_pcm",
+              },
+            ),
           ),
         );
+        appendEventLog("session.init", `已连接内核（角色：${clientRole === "observer" ? "Observer 旁路监听" : "Sandbox 独立实验"}）`);
+        if (clientRole === "controller" && pendingReplayRef.current && replayFnRef.current) {
+          const job = pendingReplayRef.current;
+          pendingReplayRef.current = null;
+          void replayFnRef.current(job.pcm16k, job.label);
+        }
       };
 
       ws.onmessage = (ev) => {
         if (ev.data instanceof ArrayBuffer) {
+          if (clientRole !== "controller") return;
           const frame = decodeAudioFrame(ev.data);
           if (frame.streamKind !== StreamKind.TtsOutput) return;
-          if (!trackerRef.current.isGenerationTagActive(frame.generationTag)) return;
-          const q = pendingMetaRef.current.get(frame.generationTag);
-          const meta = q?.shift();
+          const meta = pendingTtsMetaRef.current.get(frame.generationTag)?.shift();
           if (!meta) return;
           playerRef.current.enqueuePcm16({
             pcm16: frame.pcm16,
@@ -505,502 +298,963 @@ function VoiceAgentDesktop(): React.ReactElement {
         }
 
         const msg = parseEventEnvelope(String(ev.data));
-        if (msg.type === "vad.start") {
-          const p = msg.payload as { vad_prob: number; speech_start_pts_ms: number };
-          vadInSpeechRef.current = true;
-          speechStartPtsRef.current = p.speech_start_pts_ms;
-          setVadProb(p.vad_prob);
-          const speaking =
-            playerRef.current.getMode() === "playing" ||
-            (typeof window !== "undefined" && "speechSynthesis" in window && window.speechSynthesis.speaking);
-          if (speaking) {
-            suspectedInterruptMsRef.current = performance.now();
-            playerRef.current.duck(0.15);
-          }
+        if (msg.type === "audio.level") {
+          const p = msg.payload as EventPayloadMap["audio.level"];
+          pushScopePatch({ rmsDb: p.mic_rms_db });
+        } else if (msg.type === "vad.state") {
+          const p = msg.payload as EventPayloadMap["vad.state"];
+          pushScopePatch({ vadProb: p.vad_prob });
+        } else if (msg.type === "vad.start") {
+          const p = msg.payload as EventPayloadMap["vad.start"];
+          pushScopePatch({ vadProb: p.vad_prob });
+          appendEventLog("vad.start", `检测到语音起点 (prob=${p.vad_prob.toFixed(2)})`);
         } else if (msg.type === "vad.end") {
-          const p = msg.payload as { vad_prob: number };
-          vadInSpeechRef.current = false;
-          setVadProb(p.vad_prob);
-        } else if (msg.type === "asr.partial") {
-          const p = msg.payload as { text: string; audio_pts_ms: number };
-          lastPtsRef.current = p.audio_pts_ms;
-          setPartialText(p.text);
-        } else if (msg.type === "asr.final") {
-          const p = msg.payload as { text: string };
-          setPartialText("");
-          if (p.text.trim()) {
-            void runTurnRef.current(p.text.trim());
-          }
+          const p = msg.payload as EventPayloadMap["vad.end"];
+          pushScopePatch({ vadProb: p.vad_prob });
+          appendEventLog("vad.end", `语音段结束 (${p.speech_duration_ms.toFixed(0)} ms)`);
         } else if (msg.type === "turn.prediction") {
-          const p = msg.payload as {
-            p_completion: number;
-            p_floor_taking: number;
-            p_non_floor_feedback: number;
-          };
-          const probs: TurnAdapterProbabilities = {
+          const p = msg.payload as EventPayloadMap["turn.prediction"];
+          pushScopePatch({
             pCompletion: p.p_completion,
             pFloorTaking: p.p_floor_taking,
-            pNonFloorFeedback: p.p_non_floor_feedback,
-          };
-          setAdapterProb(probs);
-          const speaking =
-            playerRef.current.getMode() === "ducked" ||
-            playerRef.current.getMode() === "playing" ||
-            (typeof window !== "undefined" && "speechSynthesis" in window && window.speechSynthesis.speaking);
-          if (speaking) {
-            const decision = turnManagerRef.current.evaluate({
-              vadInSpeech: vadInSpeechRef.current,
-              speechDurationMs: Math.max(0, lastPtsRef.current - speechStartPtsRef.current),
-              silenceDurationMs: vadInSpeechRef.current ? 0 : 250,
-              assistantSpeaking: true,
-              transcript: partialTextRef.current,
-              adapter: probs,
-            });
-            if (
-              decision.event === "BACKCHANNEL" ||
-              decision.event === "NOISE" ||
-              (decision.event === "SHORT_INTERJECTION" && decision.action === "resume_playback")
-            ) {
-              playerRef.current.resume();
-            } else if (
-              decision.event === "INTERRUPTION" ||
-              (decision.event === "SHORT_INTERJECTION" && decision.action === "cancel_and_regenerate")
-            ) {
-              triggerBargeInCancel(decision.reason);
-            }
-          }
+            pBackchannel: p.p_non_floor_feedback,
+          });
+          if (p.step_ms !== undefined) setStepMs(p.step_ms);
+        } else if (msg.type === "asr.partial") {
+          const p = msg.payload as EventPayloadMap["asr.partial"];
+          setLiveTranscript(p.text);
+        } else if (msg.type === "asr.final") {
+          const p = msg.payload as EventPayloadMap["asr.final"];
+          setLiveTranscript(p.text);
+          appendEventLog("asr.final", `识别结果：${p.text} (${p.compute_ms} ms)`);
+        } else if (msg.type === "playback.cursor") {
+          const p = msg.payload as EventPayloadMap["playback.cursor"];
+          setCursorState({ mode: p.mode, charIdx: p.played_char_index, durMs: p.played_duration_ms });
+          appendEventLog("playback.cursor", `状态=${p.mode} | 已播字符=${p.played_char_index} | ${p.played_duration_ms} ms`);
         } else if (msg.type === "tts.chunk") {
-          const p = msg.payload as {
-            generation_tag: number;
-            char_start: number;
-            char_end: number;
-            sample_rate: number;
-            ttfa_ms: number;
-          };
-          if (!trackerRef.current.isGenerationTagActive(p.generation_tag)) return;
-          if (p.ttfa_ms > 0) setLastLatencyMs((prev) => ({ ...prev, ttfa: Math.round(p.ttfa_ms) }));
-          const arr = pendingMetaRef.current.get(p.generation_tag) ?? [];
-          arr.push({ charStart: p.char_start, charEnd: p.char_end, sampleRate: p.sample_rate });
-          pendingMetaRef.current.set(p.generation_tag, arr);
+          const p = msg.payload as EventPayloadMap["tts.chunk"];
+          if (clientRole === "controller") {
+            const arr = pendingTtsMetaRef.current.get(p.generation_tag) ?? [];
+            arr.push({ charStart: p.char_start, charEnd: p.char_end, sampleRate: p.sample_rate });
+            pendingTtsMetaRef.current.set(p.generation_tag, arr);
+          }
+          if (p.chunk_index === 0) {
+            appendEventLog("tts.chunk", `句 #${p.sentence_index} 首包 TTFA=${p.ttfa_ms} ms (len=${p.duration_ms} ms)`);
+          }
+        } else if (msg.type === "telemetry.gpu") {
+          void fetchRegistry(apiBase).then(setRegistry).catch(() => {});
         } else if (msg.type === "error") {
-          const p = msg.payload as { module: string; message: string };
-          setStatusNote(`[${p.module}] ${p.message}`);
+          const p = msg.payload as EventPayloadMap["error"];
+          setNotice(`[${p.module}] ${p.message}`);
+          appendEventLog("error", `[${p.module}] ${p.message}`);
         }
       };
 
       ws.onclose = () => {
-        setConnected(false);
-        if (!closed) setTimeout(connect, 1500);
+        setWsConnected(false);
+        if (!disposed) {
+          reconnectTimer = setTimeout(connect, 1500);
+        }
       };
     };
 
     connect();
-    void listAudioDevices().then(setDevices);
     return () => {
-      closed = true;
-      stopNativeSpeech();
+      disposed = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       micRef.current.stop();
+      setMicActive(false);
       wsRef.current?.close();
     };
-  }, [triggerBargeInCancel, wsUrl]);
+  }, [wsUrl, clientRole, apiBase, appendEventLog, pushScopePatch]);
 
-  const toggleMic = async (): Promise<void> => {
+  const toggleSandboxMic = async (): Promise<void> => {
+    if (clientRole !== "controller") {
+      setClientRole("controller");
+      setNotice("已切换为 Sandbox 独立实验模式，请再次点击开启麦克风。");
+      return;
+    }
     if (micActive) {
       micRef.current.stop();
       setMicActive(false);
       return;
     }
     try {
-      await micRef.current.start(
-        (pcm16k, ptsMs, rmsDb) => {
-          lastPtsRef.current = ptsMs;
-          const curMode = modeRef.current;
-          const allowStream =
-            curMode === "hands-free" || (curMode === "push-to-talk" && pttPressedRef.current);
-          setRmsHistory((prev) => [...prev.slice(1), allowStream ? rmsDb : -90]);
-
-          const ws = wsRef.current;
-          if (ws && ws.readyState === WebSocket.OPEN && curMode !== "text" && curMode !== "mute") {
-            audioSeqRef.current += 1;
-            const payload = allowStream ? pcm16k : new Int16Array(pcm16k.length);
-            ws.send(
-              encodeAudioFrame({
-                streamKind: StreamKind.MicInput,
-                seq: audioSeqRef.current,
-                ptsMs,
-                sampleRate: 16000,
-                generationTag: 0,
-                pcm16: payload,
-              }),
-            );
-          }
-        },
-        { deviceId: selectedMic, aecEnabled, noiseSuppression: true },
-      );
+      await micRef.current.start((pcm16k, ptsMs, rmsDb) => {
+        pushScopePatch({ rmsDb });
+        const ws = wsRef.current;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          seqRef.current += 1;
+          ws.send(
+            encodeAudioFrame({
+              streamKind: StreamKind.MicInput,
+              seq: seqRef.current,
+              ptsMs,
+              sampleRate: 16000,
+              generationTag: 0,
+              pcm16: pcm16k,
+            }),
+          );
+        }
+      });
       setMicActive(true);
-      setDevices(await listAudioDevices());
-      setStatusNote(null);
+      setNotice(null);
     } catch (err) {
-      setStatusNote(`麦克风启动失败：${err instanceof Error ? err.message : String(err)}`);
+      setNotice(`麦克风启动失败：${err instanceof Error ? err.message : String(err)}`);
     }
+  };
+
+  const replayPcm16kThroughPipeline = async (pcm16k: Int16Array, label: string): Promise<void> => {
+    if (clientRole !== "controller") {
+      pendingReplayRef.current = { pcm16k, label };
+      setClientRole("controller");
+      setActiveTab("scope");
+      setNotice(`已自动切换至 Sandbox 示波模式，连接就绪后自动回放：${label}`);
+      return;
+    }
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setNotice("WebSocket 未连接，无法注入回放音频。");
+      return;
+    }
+    setActiveTab("scope");
+    setReplayingAudio(true);
+    appendEventLog("replay.start", `开始流式注入音频：${label} (${(pcm16k.length / 16000).toFixed(2)} s)`);
+    try {
+      const frameSamples = 320; // 20ms @ 16kHz
+      let pts = 0;
+      for (let off = 0; off < pcm16k.length; off += frameSamples) {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) break;
+        const slice = pcm16k.subarray(off, Math.min(pcm16k.length, off + frameSamples));
+        pushScopePatch({ rmsDb: computeRmsDb(slice) });
+        seqRef.current += 1;
+        wsRef.current.send(
+          encodeAudioFrame({
+            streamKind: StreamKind.MicInput,
+            seq: seqRef.current,
+            ptsMs: pts,
+            sampleRate: 16000,
+            generationTag: 0,
+            pcm16: slice,
+          }),
+        );
+        pts += 20;
+        await new Promise((r) => setTimeout(r, 18));
+      }
+      // Append 140ms silence tail so VAD & ASR finalize cleanly.
+      const silence = new Int16Array(frameSamples);
+      for (let k = 0; k < 7; k += 1) {
+        if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) break;
+        seqRef.current += 1;
+        wsRef.current.send(
+          encodeAudioFrame({
+            streamKind: StreamKind.MicInput,
+            seq: seqRef.current,
+            ptsMs: pts + k * 20,
+            sampleRate: 16000,
+            generationTag: 0,
+            pcm16: silence,
+          }),
+        );
+        await new Promise((r) => setTimeout(r, 18));
+      }
+      appendEventLog("replay.end", `流式注入完成：${label}`);
+    } finally {
+      setReplayingAudio(false);
+    }
+  };
+  replayFnRef.current = replayPcm16kThroughPipeline;
+
+  const handleReplayFile = async (e: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    try {
+      const pcm = await decodeAudioFileToPcm16k(file);
+      await replayPcm16kThroughPipeline(pcm, file.name);
+    } catch (err) {
+      setNotice(`音频解码失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const handleSandboxTtsPreview = (): void => {
+    if (clientRole !== "controller") {
+      setClientRole("controller");
+      setNotice("已切换至 Sandbox 模式，重连后即可试听 TTS 合成。");
+      return;
+    }
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN || !sandboxTtsText.trim()) return;
+    const gen = trackerRef.current.startGeneration();
+    ws.send(
+      JSON.stringify(
+        createEvent(
+          "tts.synthesize",
+          { sessionId: trackerRef.current.ids.sessionId, turnId: gen.turnId, generationId: gen.generationId },
+          {
+            sentence_index: 0,
+            text: sandboxTtsText.trim(),
+            char_start: 0,
+            char_end: sandboxTtsText.trim().length,
+            generation_tag: gen.generationTag,
+            speaker_profile: "default",
+          },
+        ),
+      ),
+    );
+  };
+
+  const handleActivateModel = async (task: string, checkpointId: string): Promise<void> => {
+    try {
+      const updated = await activateRegistryModel(apiBase, { task, checkpoint_id: checkpointId });
+      setRegistry(updated);
+      setHealth(await fetchHealth(apiBase));
+      setNotice(`已热切换 [${task}] → ${checkpointId}`);
+      appendEventLog("model.activate", `${task} -> ${checkpointId}`);
+    } catch (err) {
+      setNotice(`切换失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const handleAsrFileSelect = async (e: React.ChangeEvent<HTMLInputElement>): Promise<void> => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    try {
+      const pcm = await decodeAudioFileToPcm16k(file);
+      setAsrAudioB64(encodePcm16kToWavBase64(pcm, 16000));
+      setAsrAudioLabel(`${file.name} (${(pcm.length / 16000).toFixed(2)} s)`);
+    } catch (err) {
+      setNotice(`读取 ASR 测试音频失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+
+  const handleRunAsrAb = async (): Promise<void> => {
+    setAsrAbLoading(true);
+    setNotice(null);
+    try {
+      const b64 = asrAudioB64 || makeSyntheticProbeWavBase64(1.2);
+      const res = await runAbAsr(apiBase, {
+        audio_base64: b64,
+        checkpoint_ids: selectedAsrIds,
+        reference_text: asrRefText.trim() || null,
+      });
+      setAsrAbResult(res);
+    } catch (err) {
+      setNotice(`ASR A/B 对比失败：${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setAsrAbLoading(false);
+    }
+  };
+
+  const handleRunTtsAb = async (): Promise<void> => {
+    if (!ttsPrompt.trim()) return;
+    setTtsAbLoading(true);
+    setNotice(null);
+    setTtsRevealed(!ttsBlindMode);
+    setMosScores({});
+    try {
+      const res = await runAbTts(apiBase, {
+        text: ttsPrompt.trim(),
+        checkpoint_ids: selectedTtsIds,
+        blind: ttsBlindMode,
+      });
+      setTtsAbResult(res);
+    } catch (err) {
+      setNotice(`TTS A/B 盲测生成失败：${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setTtsAbLoading(false);
+    }
+  };
+
+  const handleExportMosCsv = (): void => {
+    if (!ttsAbResult) return;
+    const csv = formatCsvRows(
+      ["slot_id", "checkpoint_id", "label", "mos_score", "ttfa_ms", "rtf", "duration_ms", "text"],
+      ttsAbResult.candidates.map((c) => {
+        const revealed = ttsAbResult.reveal_map[c.slot_id];
+        return [
+          c.slot_id,
+          revealed?.checkpoint_id ?? c.checkpoint_id ?? "",
+          revealed?.label ?? c.display_label,
+          mosScores[c.slot_id] ?? "",
+          c.ttfa_ms,
+          c.rtf,
+          c.duration_ms,
+          ttsAbResult.text,
+        ];
+      }),
+    );
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `voiceagent_tts_mos_${Date.now()}.csv`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const handleExportLogs = async (): Promise<void> => {
+    const jsonl = telemetryJsonlRef.current.map((row) => JSON.stringify(row)).join("\n");
+    if (window.voiceAgentDesktop) {
+      const res = await window.voiceAgentDesktop.exportLogs(jsonl);
+      if (res.saved && res.path) setNotice(`观测日志已保存至：${res.path}`);
+      return;
+    }
+    const blob = new Blob([jsonl], { type: "application/x-ndjson" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `voiceagent_telemetry_${Date.now()}.jsonl`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   const handleToggleHeavyGpu = async (): Promise<void> => {
     const bridge = window.voiceAgentDesktop;
     if (!bridge) {
-      setStatusNote("请从桌面图标启动 Electron 应用以支持应用内热切换 GPU 模型。");
+      setNotice("请从桌面 Electron 工作台启动以支持一键热重启 GPU 重型权重。");
       return;
     }
     setRestartingBackend(true);
-    const next = !heavyGpu;
-    const res = await bridge.restartBackend({ loadHeavy: next });
+    const res = await bridge.restartBackend({ loadHeavy: !heavyGpu });
     setHeavyGpu(res.heavyModelsEnabled);
-    setTtsEngine(res.heavyModelsEnabled ? "backend_pcm" : "native_voice");
     setRestartingBackend(false);
-    setStatusNote(
-      res.ok
-        ? `推理服务已重启（${res.heavyModelsEnabled ? "完整 RTX 5070 中文大模型" : "极速轻量模式"}）`
-        : "推理服务重启失败",
-    );
-  };
-
-  const handleExportLogs = async (): Promise<void> => {
-    const jsonl = eventLogRef.current.map((e) => JSON.stringify(e)).join("\n");
-    const bridge = window.voiceAgentDesktop;
-    if (bridge) {
-      const res = await bridge.exportLogs(jsonl);
-      if (res.saved && res.path) setStatusNote(`实验日志已导出至：${res.path}`);
-      return;
+    if (res.ok) {
+      await refreshMetadata();
+      setNotice(`内核已切换为：${res.heavyModelsEnabled ? "RTX 5070 完整 GPU 模型" : "轻量极速联调模式"}`);
+    } else {
+      setNotice("推理内核重启失败，请检查端口占用。");
     }
-    const blob = new Blob([jsonl], { type: "application/x-ndjson" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = `voiceagent_logs_${Date.now()}.jsonl`;
-    a.click();
   };
 
-  const turns = historyRef.current.getTurns();
-  void turnsVersion;
-  const isElectron = Boolean(window.voiceAgentDesktop?.isElectron);
+  const latest = scopePoints[scopePoints.length - 1] ?? {
+    rmsDb: -90,
+    vadProb: 0,
+    pCompletion: 0,
+    pFloorTaking: 0,
+    pBackchannel: 0,
+  };
+  const selectedExp = experiments?.reports.find((r) => r.id === selectedExpId) ?? experiments?.reports[0] ?? null;
+  const asrList = registry?.checkpoints.filter((c) => c.model_type === "asr") ?? [];
+  const turnList = registry?.checkpoints.filter((c) => c.model_type === "turn_adapter") ?? [];
+  const ttsList = registry?.checkpoints.filter((c) => c.model_type === "tts") ?? [];
 
   return (
-    <div style={{ maxWidth: 1160, margin: "0 auto", padding: 18 }}>
-      <header style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: "1px solid #1f2937", paddingBottom: 12, gap: 10, flexWrap: "wrap" }}>
+    <div style={{ maxWidth: 1260, margin: "0 auto", padding: 16 }}>
+      {/* Header */}
+      <header
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          borderBottom: "1px solid #1f2937",
+          paddingBottom: 12,
+          gap: 10,
+          flexWrap: "wrap",
+        }}
+      >
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <span style={{ width: 10, height: 10, borderRadius: "50%", background: connected ? "#22c55e" : "#ef4444", display: "inline-block" }} />
-          <strong style={{ fontSize: 18 }}>VoiceAgent</strong>
-          <span style={{ fontSize: 11, padding: "2px 7px", borderRadius: 999, background: "#1e293b", color: "#93c5fd" }}>
-            {isElectron ? "桌面版" : "网页预览"}
+          <span
+            style={{
+              width: 10,
+              height: 10,
+              borderRadius: "50%",
+              background: wsConnected ? "#22c55e" : "#ef4444",
+              display: "inline-block",
+            }}
+          />
+          <strong style={{ fontSize: 18 }}>VoiceAgent 实验与观测工作台</strong>
+          <span style={{ fontSize: 11, padding: "2px 8px", borderRadius: 999, background: "#1e293b", color: "#93c5fd" }}>
+            V2.0 R&amp;D Workbench
           </span>
+          {health?.vram && (
+            <span style={{ fontSize: 11, color: "#94a3b8" }}>
+              {health.vram.device} · VRAM {health.vram.allocated_mb} / {health.vram.total_mb} MB
+            </span>
+          )}
         </div>
 
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", fontSize: 12 }}>
-          <select
-            aria-label="麦克风设备"
-            value={selectedMic}
-            onChange={(e) => setSelectedMic(e.target.value)}
-            style={{ background: "#111827", border: "1px solid #374151", borderRadius: 6, padding: "5px 8px" }}
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <button
+            type="button"
+            style={btnStyle(clientRole === "observer", "blue")}
+            onClick={() => setClientRole("observer")}
           >
-            <option value="default">默认麦克风</option>
-            {devices.filter((d) => d.kind === "audioinput").map((d) => (
-              <option key={d.deviceId} value={d.deviceId}>{d.label}</option>
-            ))}
-          </select>
-
-          <select
-            aria-label="播报语音引擎"
-            value={ttsEngine}
-            onChange={(e) => setTtsEngine(e.target.value as TtsEngineChoice)}
-            style={{ background: "#111827", border: "1px solid #374151", borderRadius: 6, padding: "5px 8px" }}
+            Observer 旁路观测 Pi
+          </button>
+          <button
+            type="button"
+            style={btnStyle(clientRole === "controller", "green")}
+            onClick={() => setClientRole("controller")}
           >
-            <option value="native_voice">语音：Windows 中文即时播报</option>
-            <option value="backend_pcm">语音：本地 Qwen3-TTS (中文)</option>
-          </select>
-
-          <select
-            aria-label="轮次预测策略"
-            value={turnStrategy}
-            onChange={(e) => {
-              const s = e.target.value as TurnStrategy;
-              setTurnStrategy(s);
-              turnManagerRef.current.setStrategy(s);
-            }}
-            style={{ background: "#111827", border: "1px solid #374151", borderRadius: 6, padding: "5px 8px" }}
-          >
-            <option value="hybrid">轮次：混合策略 (GRU+规则)</option>
-            <option value="adapter">轮次：Causal GRU 模型</option>
-            <option value="smart_turn">轮次：Smart Turn 基线</option>
-            <option value="fixed_silence">轮次：固定静音阈值</option>
-          </select>
-
-          <select
-            aria-label="运行模式"
-            value={agentMode}
-            onChange={(e) => setAgentMode(e.target.value as "conversation" | "action")}
-            style={{ background: "#111827", border: "1px solid #374151", borderRadius: 6, padding: "5px 8px" }}
-          >
-            <option value="conversation">模式：普通对话</option>
-            <option value="action">模式：执行操作</option>
-          </select>
-
-          <select
-            aria-label="权限级别"
-            value={permLevel}
-            onChange={(e) => setPermLevel(e.target.value as "readonly" | "ask" | "trusted")}
-            style={{ background: "#111827", border: "1px solid #374151", borderRadius: 6, padding: "5px 8px" }}
-          >
-            <option value="readonly">权限：只读</option>
-            <option value="ask">权限：执行前询问</option>
-            <option value="trusted">权限：信任白名单</option>
-          </select>
-
+            Sandbox 独立实验
+          </button>
           <button
             type="button"
             disabled={restartingBackend}
+            style={btnStyle(heavyGpu, "green")}
             onClick={() => void handleToggleHeavyGpu()}
-            style={{ background: heavyGpu ? "#059669" : "#374151", border: "none", borderRadius: 6, padding: "5px 10px", cursor: "pointer" }}
           >
-            {restartingBackend ? "重启中..." : heavyGpu ? "GPU 大模型：已开启" : "GPU 大模型：极速模式"}
+            {restartingBackend ? "重启中..." : heavyGpu ? "GPU 完整权重：开" : "GPU 轻量模式"}
           </button>
-
-          <button
-            type="button"
-            onClick={() => setDevMode((v) => !v)}
-            style={{ background: devMode ? "#1d4ed8" : "#1f2937", border: "none", borderRadius: 6, padding: "5px 10px", cursor: "pointer" }}
-          >
-            开发者面板
+          <button type="button" style={btnStyle(false, "gray")} onClick={() => void handleExportLogs()}>
+            导出日志
           </button>
         </div>
       </header>
 
-      <div style={{ display: "grid", gridTemplateColumns: devMode ? "1.65fr 1fr" : "1fr", gap: 16, marginTop: 14 }}>
-        <section style={{ background: "#111827", border: "1px solid #1f2937", borderRadius: 12, padding: 16, display: "flex", flexDirection: "column", minHeight: 590 }}>
-          <div style={{ flex: 1, overflowY: "auto", marginBottom: 14 }}>
-            {turns.length === 0 && !partialText && (
-              <div style={{ color: "#64748b", padding: "48px 16px", textAlign: "center", lineHeight: 1.8 }}>
-                <div style={{ fontSize: 15, color: "#cbd5e1", marginBottom: 6 }}>VoiceAgent 本地中文语音助手已就绪</div>
-                点击下方 <strong>开启麦克风</strong> 开始全双工语音对话（或按 <strong>Alt+Space</strong> 按键说话），
-                也可以直接在底部输入框打字体验中文播报与高危操作审批拦截。
+      {/* Navigation Tabs */}
+      <nav style={{ display: "flex", gap: 8, marginTop: 12, marginBottom: 14, flexWrap: "wrap" }}>
+        {(
+          [
+            ["scope", "1. 实时信号示波台"],
+            ["registry", "2. 模型热插拔注册表"],
+            ["ab_lab", "3. ASR / TTS A/B 盲测实验台"],
+            ["experiments", "4. 实验报告与 Bad Case 回放"],
+          ] as Array<[WorkbenchTab, string]>
+        ).map(([tab, label]) => (
+          <button
+            key={tab}
+            type="button"
+            style={btnStyle(activeTab === tab, "blue")}
+            onClick={() => setActiveTab(tab)}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
+
+      {notice && (
+        <div
+          style={{
+            marginBottom: 12,
+            padding: "8px 12px",
+            borderRadius: 8,
+            background: "#1e293b",
+            border: "1px solid #38bdf8",
+            fontSize: 12,
+            display: "flex",
+            justifyContent: "space-between",
+          }}
+        >
+          <span>{notice}</span>
+          <button
+            type="button"
+            onClick={() => setNotice(null)}
+            style={{ background: "transparent", border: "none", cursor: "pointer", color: "#94a3b8" }}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      {/* TAB 1: LIVE OSCILLOSCOPE & OBSERVER */}
+      {activeTab === "scope" && (
+        <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 14 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            <section style={cardStyle()}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                <strong>全双工实时信号示波器（VAD + CausalTurnGRU 三头概率）</strong>
+                <span style={{ fontSize: 12, color: "#94a3b8" }}>
+                  {clientRole === "observer"
+                    ? "正在旁路监听本机 Pi /voice 实时信号"
+                    : "Sandbox 独立音频注入模式"}
+                </span>
               </div>
-            )}
-            {turns.map((t) => (
-              <div key={t.turnId} style={{ marginBottom: 16 }}>
-                <div style={{ marginBottom: 4 }}>
-                  <span style={{ color: "#38bdf8", fontWeight: 600 }}>用户：</span>
-                  {t.userTranscript}
+              <ScopeCanvas points={scopePoints} height={210} />
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, marginTop: 12, fontSize: 12 }}>
+                <div style={cardStyle({ padding: 8, background: "#0b1220" })}>
+                  <div style={{ color: "#94a3b8" }}>Silero VAD</div>
+                  <strong style={{ color: "#38bdf8", fontSize: 16 }}>{(latest.vadProb * 100).toFixed(1)}%</strong>
                 </div>
-                {t.toolCalls.map((tc) => (
-                  <div key={tc.toolCallId} style={{ fontSize: 12, color: "#fbbf24", background: "#1e293b", padding: "6px 10px", borderRadius: 6, margin: "4px 0" }}>
-                    工具 <code>{tc.toolName}</code> [{tc.status}] {tc.sideEffectCommitted ? "（已生效）" : ""}：{tc.result}
-                  </div>
-                ))}
-                <div>
-                  <span style={{ color: "#34d399", fontWeight: 600 }}>助手：</span>
-                  {t.interrupted ? (
-                    <>
-                      <span>{t.assistantAudibleReply || "（尚未播报即被打断）"}</span>
-                      <span style={{ color: "#f87171", fontSize: 12, marginLeft: 6 }}>[已被打断 — 未播内容已保留]</span>
-                    </>
-                  ) : (
-                    t.assistantFullReply
-                  )}
+                <div style={cardStyle({ padding: 8, background: "#0b1220" })}>
+                  <div style={{ color: "#94a3b8" }}>EOT 完成</div>
+                  <strong style={{ color: "#34d399", fontSize: 16 }}>{(latest.pCompletion * 100).toFixed(1)}%</strong>
+                </div>
+                <div style={cardStyle({ padding: 8, background: "#0b1220" })}>
+                  <div style={{ color: "#94a3b8" }}>Floor 打断</div>
+                  <strong style={{ color: "#f43f5e", fontSize: 16 }}>{(latest.pFloorTaking * 100).toFixed(1)}%</strong>
+                </div>
+                <div style={cardStyle({ padding: 8, background: "#0b1220" })}>
+                  <div style={{ color: "#94a3b8" }}>Backchannel</div>
+                  <strong style={{ color: "#fbbf24", fontSize: 16 }}>{(latest.pBackchannel * 100).toFixed(1)}%</strong>
+                </div>
+                <div style={cardStyle({ padding: 8, background: "#0b1220" })}>
+                  <div style={{ color: "#94a3b8" }}>播放游标 / 步耗时</div>
+                  <strong style={{ fontSize: 13 }}>
+                    {cursorState.mode} · {cursorState.charIdx}字{stepMs !== null ? ` · ${stepMs}ms` : ""}
+                  </strong>
                 </div>
               </div>
-            ))}
-            {partialText && (
-              <div style={{ color: "#93c5fd", fontStyle: "italic" }}>用户（实时识别）：{partialText}</div>
-            )}
-          </div>
+            </section>
 
-          {pendingApproval && (
-            <div role="dialog" style={{ border: "1px solid #f59e0b", background: "#451a03", borderRadius: 8, padding: 12, marginBottom: 12 }}>
-              <strong>需要授权确认：{pendingApproval.toolName}</strong>
-              <div style={{ fontSize: 13, marginTop: 4 }}>{pendingApproval.impactSummary}</div>
-              <div style={{ fontSize: 11, color: "#fde68a", marginTop: 4 }}>
-                请点击下方按钮或直接说“确认”（沉默或含义不清默认拒绝）
-              </div>
-              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                <button
-                  type="button"
-                  onClick={() => void respondApproval(true, "ui", "已在桌面弹窗点击同意")}
-                  style={{ background: "#16a34a", border: "none", borderRadius: 6, padding: "5px 14px", cursor: "pointer", fontWeight: 600 }}
-                >
-                  同意执行
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void respondApproval(false, "ui", "已在桌面弹窗点击拒绝")}
-                  style={{ background: "#dc2626", border: "none", borderRadius: 6, padding: "5px 14px", cursor: "pointer", fontWeight: 600 }}
-                >
-                  拒绝
-                </button>
-              </div>
-            </div>
-          )}
-
-          <canvas ref={canvasRef} width={640} height={54} style={{ width: "100%", height: 54, background: "#0b0f17", borderRadius: 8, marginBottom: 10 }} />
-
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
-            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-              <button
-                type="button"
-                onClick={() => void toggleMic()}
-                style={{ background: micActive ? "#dc2626" : "#2563eb", border: "none", borderRadius: 8, padding: "7px 14px", fontWeight: 600, cursor: "pointer" }}
+            <section style={cardStyle()}>
+              <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 6 }}>最新流式 ASR 识别文本</div>
+              <div
+                style={{
+                  minHeight: 42,
+                  padding: 10,
+                  borderRadius: 8,
+                  background: "#060911",
+                  border: "1px solid #1e293b",
+                  fontSize: 14,
+                }}
               >
-                {micActive ? "关闭麦克风" : "开启麦克风"}
-              </button>
+                {liveTranscript || "等待 Pi /voice 或 Sandbox 语音输入..."}
+              </div>
 
-              {(["hands-free", "push-to-talk", "text", "mute"] as InteractionMode[]).map((m) => (
+              <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap", alignItems: "center" }}>
                 <button
-                  key={m}
                   type="button"
-                  onClick={() => {
-                    setMode(m);
-                    micRef.current.setMuted(m === "mute");
-                  }}
+                  style={btnStyle(micActive, micActive ? "red" : "green")}
+                  onClick={() => void toggleSandboxMic()}
+                >
+                  {micActive ? "停止 Sandbox 麦克风" : "开启 Sandbox 麦克风"}
+                </button>
+                <label style={{ ...btnStyle(false, "gray"), display: "inline-block" }}>
+                  {replayingAudio ? "正在注入回放..." : "注入音频文件回放 (WAV/MP3)"}
+                  <input
+                    type="file"
+                    accept="audio/*"
+                    disabled={replayingAudio}
+                    onChange={(e) => void handleReplayFile(e)}
+                    style={{ display: "none" }}
+                  />
+                </label>
+                <input
+                  type="text"
+                  value={sandboxTtsText}
+                  onChange={(e) => setSandboxTtsText(e.target.value)}
                   style={{
-                    background: mode === m ? "#0284c7" : "#1f2937",
-                    border: "none",
+                    flex: 1,
+                    minWidth: 200,
+                    background: "#060911",
+                    border: "1px solid #334155",
                     borderRadius: 6,
                     padding: "6px 10px",
                     fontSize: 12,
-                    cursor: "pointer",
                   }}
-                >
-                  {MODE_LABELS[m]}
+                />
+                <button type="button" style={btnStyle(true, "blue")} onClick={handleSandboxTtsPreview}>
+                  试听 TTS
                 </button>
-              ))}
-
-              {mode === "push-to-talk" && (
-                <button
-                  type="button"
-                  onMouseDown={() => setPttPressed(true)}
-                  onMouseUp={() => setPttPressed(false)}
-                  onMouseLeave={() => setPttPressed(false)}
-                  style={{
-                    background: pttPressed ? "#7c3aed" : "#312e81",
-                    border: "1px solid #8b5cf6",
-                    borderRadius: 8,
-                    padding: "7px 12px",
-                    fontSize: 12,
-                    fontWeight: 600,
-                    cursor: "pointer",
-                  }}
-                >
-                  {pttPressed ? "正在录音...（松开结束）" : "按住说话"}
-                </button>
-              )}
-
-              <button
-                type="button"
-                onClick={() => triggerBargeInCancel("manual_stop")}
-                style={{ background: "#374151", border: "none", borderRadius: 8, padding: "7px 12px", cursor: "pointer", fontSize: 12 }}
-              >
-                打断 / 停止播报
-              </button>
-            </div>
-
-            <div style={{ display: "flex", gap: 8, fontSize: 12 }}>
-              <label style={{ display: "flex", alignItems: "center", gap: 4, color: "#94a3b8" }}>
-                <input type="checkbox" checked={aecEnabled} onChange={(e) => setAecEnabled(e.target.checked)} />
-                回声消除
-              </label>
-              <span style={{ padding: "4px 8px", borderRadius: 999, background: micActive ? "#0c4a6e" : "#1f2937" }}>
-                麦克风：{micActive ? (mode === "mute" ? "已静音" : "监听中") : "未开启"}
-              </span>
-              <span style={{ padding: "4px 8px", borderRadius: 999, background: assistantState === "speaking" ? "#065f46" : "#1f2937" }}>
-                助手：{ASSISTANT_STATE_LABELS[assistantState] ?? assistantState}
-              </span>
-            </div>
+              </div>
+            </section>
           </div>
 
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (!textInput.trim()) return;
-              const q = textInput.trim();
-              setTextInput("");
-              void runTurn(q);
-            }}
-            style={{ display: "flex", gap: 8 }}
-          >
-            <input
-              type="text"
-              value={textInput}
-              onChange={(e) => setTextInput(e.target.value)}
-              placeholder="直接说话或在此输入中文（输入“删除测试文件”可体验高危操作弹窗拦截）..."
-              style={{ flex: 1, background: "#0b0f17", border: "1px solid #374151", borderRadius: 8, padding: "8px 12px" }}
-            />
-            <button type="submit" style={{ background: "#0ea5e9", border: "none", borderRadius: 8, padding: "8px 16px", fontWeight: 600, cursor: "pointer" }}>
-              发送
-            </button>
-          </form>
-          {statusNote && <div style={{ color: "#fbbf24", fontSize: 12, marginTop: 8 }}>{statusNote}</div>}
-        </section>
+          {/* Right telemetry & event log */}
+          <aside style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+            <section style={cardStyle()}>
+              <strong style={{ fontSize: 13 }}>当前激活模型栈</strong>
+              <div style={{ fontSize: 12, color: "#cbd5e1", marginTop: 8, lineHeight: 1.8 }}>
+                <div>VAD：<code>{health?.models.vad?.backend ?? "-"}</code></div>
+                <div>ASR：<code>{health?.models.asr.active_id ?? health?.models.asr.backend ?? "-"}</code></div>
+                <div>
+                  Turn：<code>{health?.models.turn_adapter.version ?? "-"}</code> ({health?.models.turn_adapter.strategy ?? "hybrid"})
+                </div>
+                <div>TTS：<code>{health?.models.tts.active_id ?? health?.models.tts.backend ?? "-"}</code></div>
+                <div>当前观测端数量：<code>{health?.observers_connected ?? 0}</code></div>
+              </div>
+            </section>
 
-        {devMode && (
-          <aside style={{ background: "#111827", border: "1px solid #1f2937", borderRadius: 12, padding: 16, fontSize: 13, display: "flex", flexDirection: "column", gap: 12 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <strong>开发者实时监控面板</strong>
-              <button
-                type="button"
-                onClick={() => void handleExportLogs()}
-                style={{ background: "#1f2937", border: "1px solid #374151", borderRadius: 6, padding: "3px 8px", fontSize: 11, cursor: "pointer" }}
-              >
-                导出 JSONL 日志
-              </button>
-            </div>
+            <section style={cardStyle({ flex: 1, display: "flex", flexDirection: "column", maxHeight: 360 })}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
+                <strong style={{ fontSize: 13 }}>实时协议事件流</strong>
+                <button type="button" style={btnStyle(false, "gray")} onClick={() => setLiveEvents([])}>
+                  清空
+                </button>
+              </div>
+              <div style={{ overflowY: "auto", fontSize: 11, lineHeight: 1.65 }}>
+                {liveEvents.length === 0 ? (
+                  <div style={{ color: "#64748b" }}>暂无事件。请在终端启用 Pi `/voice` 或切换到 Sandbox 注入测试音频。</div>
+                ) : (
+                  liveEvents.map((ev) => (
+                    <div key={ev.id} style={{ borderBottom: "1px solid #1e293b", padding: "4px 0" }}>
+                      <span style={{ color: "#64748b" }}>[{ev.ts}]</span>{" "}
+                      <code style={{ color: "#38bdf8" }}>{ev.type}</code> {ev.summary}
+                    </div>
+                  ))
+                )}
+              </div>
+            </section>
+          </aside>
+        </div>
+      )}
 
-            <div>
-              <div style={{ color: "#94a3b8", marginBottom: 4 }}>Silero VAD 语音概率：{(vadProb * 100).toFixed(1)}%</div>
-              <div style={{ height: 8, background: "#1f2937", borderRadius: 4, overflow: "hidden" }}>
-                <div style={{ width: `${Math.min(100, vadProb * 100)}%`, height: "100%", background: "#38bdf8" }} />
+      {/* TAB 2: CHECKPOINT REGISTRY HOT-SWAP */}
+      {activeTab === "registry" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <section style={cardStyle()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+              <div>
+                <strong>全双工轮次决策策略（Turn Strategy 热切换）</strong>
+                <div style={{ fontSize: 12, color: "#94a3b8", marginTop: 2 }}>
+                  无需重启进程，实时切换在线轮次控制器策略以对比消融效果
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {Object.entries(TURN_STRATEGY_LABELS).map(([key, label]) => (
+                  <button
+                    key={key}
+                    type="button"
+                    style={btnStyle(registry?.turn_strategy === key, "blue")}
+                    onClick={() => void handleActivateModel("turn_strategy", key)}
+                  >
+                    {label}
+                  </button>
+                ))}
               </div>
             </div>
+          </section>
 
-            <div>
-              <div style={{ color: "#94a3b8", marginBottom: 6 }}>Causal GRU 轮次预测概率</div>
-              {[
-                ["发言完成 (EOT)", adapterProb?.pCompletion ?? 0, "#22c55e"],
-                ["主动打断 (Interrupt)", adapterProb?.pFloorTaking ?? 0, "#ef4444"],
-                ["短暂附和 (Backchannel)", adapterProb?.pNonFloorFeedback ?? 0, "#eab308"],
-              ].map(([label, val, color]) => (
-                <div key={String(label)} style={{ marginBottom: 6 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12 }}>
-                    <span>{label}</span>
-                    <span>{((val as number) * 100).toFixed(1)}%</span>
-                  </div>
-                  <div style={{ height: 6, background: "#1f2937", borderRadius: 3 }}>
-                    <div style={{ width: `${Math.min(100, (val as number) * 100)}%`, height: "100%", background: String(color) }} />
-                  </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14 }}>
+            {(
+              [
+                ["asr", "ASR 流式识别与 LoRA 权重", asrList],
+                ["turn_adapter", "CausalTurnGRU 与消融权重", turnList],
+                ["tts", "TTS 引擎与音色微调权重", ttsList],
+              ] as const
+            ).map(([task, title, list]) => (
+              <section key={task} style={cardStyle()}>
+                <strong style={{ fontSize: 14 }}>{title}</strong>
+                <div style={{ display: "flex", flexDirection: "column", gap: 10, marginTop: 10 }}>
+                  {list.map((ckpt) => {
+                    const isActive = registry?.active_ids[task] === ckpt.checkpoint_id;
+                    return (
+                      <div
+                        key={ckpt.checkpoint_id}
+                        style={{
+                          padding: 10,
+                          borderRadius: 8,
+                          background: isActive ? "#0f2942" : "#0b1220",
+                          border: `1px solid ${isActive ? "#38bdf8" : "#1e293b"}`,
+                          fontSize: 12,
+                        }}
+                      >
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+                          <strong>{ckpt.label}</strong>
+                          <button
+                            type="button"
+                            disabled={isActive}
+                            style={btnStyle(isActive, "green")}
+                            onClick={() => void handleActivateModel(task, ckpt.checkpoint_id)}
+                          >
+                            {isActive ? "已激活" : "热切换"}
+                          </button>
+                        </div>
+                        <div style={{ color: "#94a3b8", marginTop: 4 }}>
+                          ID: <code>{ckpt.checkpoint_id}</code> · {ckpt.experiment_id}
+                        </div>
+                        {ckpt.path && (
+                          <div style={{ color: "#64748b", marginTop: 2, wordBreak: "break-all" }}>{ckpt.path}</div>
+                        )}
+                        {Object.keys(ckpt.metrics).length > 0 && (
+                          <div style={{ color: "#34d399", marginTop: 4 }}>
+                            指标：
+                            {Object.entries(ckpt.metrics)
+                              .map(([k, v]) => `${k}=${Number(v).toFixed(3)}`)
+                              .join(" | ")}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
-              ))}
+              </section>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* TAB 3: ASR & TTS A/B EVALUATION LAB */}
+      {activeTab === "ab_lab" && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          {/* ASR A/B */}
+          <section style={cardStyle()}>
+            <strong style={{ fontSize: 15 }}>ASR 同音频多模型对比（WER / CER / RTF）</strong>
+            <div style={{ fontSize: 12, color: "#94a3b8", marginTop: 4 }}>
+              勾选多个 ASR Checkpoint，对同一段音频执行并发对照识别
             </div>
 
-            <div style={{ borderTop: "1px solid #1f2937", paddingTop: 10, display: "grid", gap: 4 }}>
-              <div><strong>实时延迟</strong></div>
-              <div>首包延迟 (TTFA)：{lastLatencyMs.ttfa ?? "-"} ms</div>
-              <div>端到端播报 (E2E)：{lastLatencyMs.e2e ?? "-"} ms</div>
-              <div>打断停播延迟：{lastLatencyMs.bargeIn ?? "-"} ms</div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+              {asrList.map((c) => {
+                const checked = selectedAsrIds.includes(c.checkpoint_id);
+                return (
+                  <label key={c.checkpoint_id} style={{ fontSize: 12, display: "flex", gap: 4, alignItems: "center" }}>
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() =>
+                        setSelectedAsrIds((prev) =>
+                          checked ? prev.filter((id) => id !== c.checkpoint_id) : [...prev, c.checkpoint_id],
+                        )
+                      }
+                    />
+                    {c.label}
+                  </label>
+                );
+              })}
             </div>
 
-            <div style={{ borderTop: "1px solid #1f2937", paddingTop: 10, display: "grid", gap: 4, fontSize: 12 }}>
-              <div><strong>RTX 5070 与在线模型</strong></div>
-              <div>设备：{health?.vram.device ?? "检测中..."}</div>
-              <div>显存：{health ? `${health.vram.allocated_mb} / ${health.vram.total_mb} MB` : "-"}</div>
-              <div>VAD：{health?.models.vad?.backend ?? "-"}</div>
-              <div>ASR：{health?.models.asr.backend ?? health?.models.asr.model_id ?? "-"}</div>
-              <div>TTS：{health?.models.tts.backend ?? health?.models.tts.model_id ?? "-"}</div>
-              <div>轮次模型：{health?.models.turn_adapter.version ?? "-"}（{health?.models.turn_adapter.params ?? 0} 参数）</div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 10, flexWrap: "wrap" }}>
+              <label style={{ ...btnStyle(false, "gray"), display: "inline-block" }}>
+                上传测试音频 (WAV/MP3)
+                <input type="file" accept="audio/*" onChange={(e) => void handleAsrFileSelect(e)} style={{ display: "none" }} />
+              </label>
+              <span style={{ fontSize: 11, color: "#94a3b8" }}>{asrAudioLabel}</span>
+            </div>
+
+            <input
+              type="text"
+              placeholder="可选：输入标准参考文本（Reference），自动计算 WER / CER"
+              value={asrRefText}
+              onChange={(e) => setAsrRefText(e.target.value)}
+              style={{
+                width: "100%",
+                marginTop: 10,
+                background: "#060911",
+                border: "1px solid #334155",
+                borderRadius: 6,
+                padding: "7px 10px",
+                fontSize: 12,
+              }}
+            />
+
+            <button
+              type="button"
+              disabled={asrAbLoading}
+              style={{ ...btnStyle(true, "blue"), marginTop: 10 }}
+              onClick={() => void handleRunAsrAb()}
+            >
+              {asrAbLoading ? "对比识别中..." : "运行 ASR A/B 对比"}
+            </button>
+
+            {asrAbResult && (
+              <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+                {asrAbResult.candidates.map((cand) => (
+                  <div key={cand.checkpoint_id} style={cardStyle({ background: "#060911", padding: 10, fontSize: 12 })}>
+                    <div style={{ display: "flex", justifyContent: "space-between" }}>
+                      <strong>{cand.label}</strong>
+                      <span style={{ color: "#94a3b8" }}>
+                        {cand.compute_ms} ms · RTF {cand.rtf}
+                        {cand.wer !== null ? ` · WER ${(cand.wer * 100).toFixed(1)}% · CER ${(cand.cer! * 100).toFixed(1)}%` : ""}
+                      </span>
+                    </div>
+                    <div style={{ marginTop: 6, color: "#e2e8f0" }}>{cand.transcript || "(空转写)"}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+
+          {/* TTS Blind MOS A/B */}
+          <section style={cardStyle()}>
+            <strong style={{ fontSize: 15 }}>TTS 双盲音色对比与 MOS 评分台</strong>
+            <div style={{ fontSize: 12, color: "#94a3b8", marginTop: 4 }}>
+              匿名打乱 Pretrained / Zero-shot / Finetuned 音色顺序，盲听打分后揭晓身份并导出 CSV
+            </div>
+
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
+              {ttsList.map((c) => {
+                const checked = selectedTtsIds.includes(c.checkpoint_id);
+                return (
+                  <label key={c.checkpoint_id} style={{ fontSize: 12, display: "flex", gap: 4, alignItems: "center" }}>
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() =>
+                        setSelectedTtsIds((prev) =>
+                          checked ? prev.filter((id) => id !== c.checkpoint_id) : [...prev, c.checkpoint_id],
+                        )
+                      }
+                    />
+                    {c.label}
+                  </label>
+                );
+              })}
+            </div>
+
+            <textarea
+              rows={2}
+              value={ttsPrompt}
+              onChange={(e) => setTtsPrompt(e.target.value)}
+              style={{
+                width: "100%",
+                marginTop: 10,
+                background: "#060911",
+                border: "1px solid #334155",
+                borderRadius: 6,
+                padding: 8,
+                fontSize: 12,
+              }}
+            />
+
+            <div style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 8, flexWrap: "wrap" }}>
+              <label style={{ fontSize: 12, display: "flex", gap: 4, alignItems: "center" }}>
+                <input type="checkbox" checked={ttsBlindMode} onChange={(e) => setTtsBlindMode(e.target.checked)} />
+                开启双盲随机打乱
+              </label>
+              <button
+                type="button"
+                disabled={ttsAbLoading}
+                style={btnStyle(true, "green")}
+                onClick={() => void handleRunTtsAb()}
+              >
+                {ttsAbLoading ? "合成对比音频中..." : "生成盲测对比音频"}
+              </button>
+              {ttsAbResult && ttsBlindMode && !ttsRevealed && (
+                <button type="button" style={btnStyle(true, "blue")} onClick={() => setTtsRevealed(true)}>
+                  揭晓真实模型身份
+                </button>
+              )}
+              {ttsAbResult && (
+                <button type="button" style={btnStyle(false, "gray")} onClick={handleExportMosCsv}>
+                  导出 MOS CSV
+                </button>
+              )}
+            </div>
+
+            {ttsAbResult && (
+              <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 10 }}>
+                {ttsAbResult.candidates.map((cand) => {
+                  const revealed = ttsRevealed ? ttsAbResult.reveal_map[cand.slot_id] : null;
+                  return (
+                    <div key={cand.slot_id} style={cardStyle({ background: "#060911", padding: 10, fontSize: 12 })}>
+                      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                        <strong>
+                          {cand.display_label}
+                          {revealed ? ` → ${revealed.label} (${revealed.checkpoint_id})` : ""}
+                        </strong>
+                        <span style={{ color: "#94a3b8" }}>
+                          TTFA {cand.ttfa_ms} ms · RTF {cand.rtf} · {cand.duration_ms} ms
+                        </span>
+                      </div>
+                      <audio
+                        controls
+                        src={`data:audio/wav;base64,${cand.wav_base64}`}
+                        style={{ width: "100%", height: 34 }}
+                      />
+                      <div style={{ display: "flex", gap: 6, alignItems: "center", marginTop: 6 }}>
+                        <span style={{ color: "#94a3b8" }}>主观 MOS 评分：</span>
+                        {[1, 2, 3, 4, 5].map((score) => (
+                          <button
+                            key={score}
+                            type="button"
+                            style={btnStyle(mosScores[cand.slot_id] === score, "blue")}
+                            onClick={() => setMosScores((prev) => ({ ...prev, [cand.slot_id]: score }))}
+                          >
+                            {score} 分
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        </div>
+      )}
+
+      {/* TAB 4: EXPERIMENT REPORTS & BAD CASE REPLAY */}
+      {activeTab === "experiments" && (
+        <div style={{ display: "grid", gridTemplateColumns: "300px 1fr", gap: 14 }}>
+          <aside style={cardStyle({ display: "flex", flexDirection: "column", gap: 8 })}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <strong style={{ fontSize: 13 }}>实验报告列表 (docs/experiments)</strong>
+              <button type="button" style={btnStyle(false, "gray")} onClick={() => void refreshMetadata()}>
+                刷新
+              </button>
+            </div>
+            {(experiments?.reports ?? []).map((rep) => (
+              <button
+                key={rep.id}
+                type="button"
+                onClick={() => setSelectedExpId(rep.id)}
+                style={{
+                  textAlign: "left",
+                  padding: 10,
+                  borderRadius: 8,
+                  cursor: "pointer",
+                  background: selectedExp?.id === rep.id ? "#0f2942" : "#0b1220",
+                  border: `1px solid ${selectedExp?.id === rep.id ? "#38bdf8" : "#1e293b"}`,
+                  fontSize: 12,
+                }}
+              >
+                <div style={{ fontWeight: 600 }}>{rep.title}</div>
+                <div style={{ color: "#64748b", fontSize: 11, marginTop: 2 }}>
+                  {rep.markdown_file ?? rep.manifest_file}
+                </div>
+              </button>
+            ))}
+
+            <div style={{ borderTop: "1px solid #1f2937", paddingTop: 10, marginTop: 8 }}>
+              <strong style={{ fontSize: 12 }}>Bad Case 录音回放诊断</strong>
+              <div style={{ fontSize: 11, color: "#94a3b8", margin: "4px 0 8px" }}>
+                导入误截断或误识别样本，自动跳转示波台按 20ms 实时帧回放定位问题帧
+              </div>
+              <label style={{ ...btnStyle(true, "blue"), display: "inline-block" }}>
+                选择 Bad Case 音频回放
+                <input type="file" accept="audio/*" onChange={(e) => void handleReplayFile(e)} style={{ display: "none" }} />
+              </label>
             </div>
           </aside>
-        )}
-      </div>
+
+          <section style={cardStyle()}>
+            {selectedExp ? (
+              <div>
+                <h3 style={{ marginTop: 0 }}>{selectedExp.title}</h3>
+                {selectedExp.markdown && (
+                  <pre
+                    style={{
+                      whiteSpace: "pre-wrap",
+                      background: "#060911",
+                      border: "1px solid #1e293b",
+                      borderRadius: 8,
+                      padding: 14,
+                      fontSize: 12,
+                      lineHeight: 1.65,
+                      overflowX: "auto",
+                    }}
+                  >
+                    {selectedExp.markdown}
+                  </pre>
+                )}
+                {selectedExp.manifest && (
+                  <details style={{ marginTop: 10 }}>
+                    <summary style={{ cursor: "pointer", fontSize: 12, color: "#38bdf8" }}>
+                      展开原始 JSON Manifest ({selectedExp.manifest_file})
+                    </summary>
+                    <pre
+                      style={{
+                        whiteSpace: "pre-wrap",
+                        background: "#060911",
+                        border: "1px solid #1e293b",
+                        borderRadius: 8,
+                        padding: 12,
+                        fontSize: 11,
+                        marginTop: 8,
+                        maxHeight: 280,
+                        overflowY: "auto",
+                      }}
+                    >
+                      {JSON.stringify(selectedExp.manifest, null, 2)}
+                    </pre>
+                  </details>
+                )}
+              </div>
+            ) : (
+              <div style={{ color: "#64748b" }}>暂无已归档实验报告。</div>
+            )}
+          </section>
+        </div>
+      )}
     </div>
   );
 }
 
 const rootEl = document.getElementById("root");
 if (rootEl) {
-  createRoot(rootEl).render(<VoiceAgentDesktop />);
+  createRoot(rootEl).render(<VoiceWorkbench />);
 }

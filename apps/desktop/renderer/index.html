@@ -5,9 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';"
+      content="default-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:* blob: data:; media-src 'self' blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';"
     />
-    <title>VoiceAgent — 本地全双工语音智能体</title>
+    <title>VoiceAgent — 语音算法实验与观测工作台</title>
     <style>
       * { box-sizing: border-box; }
       body {
@@ -16,9 +16,12 @@
         color: #e5e7eb;
         font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
       }
-      button, select, input {
+      button, select, input, textarea {
         font: inherit;
         color: inherit;
+      }
+      code, pre {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       }
     </style>
   </head>

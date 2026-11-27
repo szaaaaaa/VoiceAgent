@@ -87,7 +87,7 @@ function createWindow() {
     show: !isSmoke,
     backgroundColor: "#0b0f17",
     icon: path.join(__dirname, "assets", "voiceagent.ico"),
-    title: "VoiceAgent — 本地全双工语音智能体",
+    title: "VoiceAgent — 语音算法实验与观测工作台",
     autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
@@ -114,14 +114,14 @@ function createWindow() {
         await new Promise((r) => setTimeout(r, 1000));
         const title = await mainWin.webContents.executeJavaScript("document.title");
         const snapshot = await mainWin.webContents.executeJavaScript(
-          "({ hasRoot: Boolean(document.getElementById('root') && document.getElementById('root').innerText.includes('VoiceAgent')), hasDesktopBridge: Boolean(window.voiceAgentDesktop && window.voiceAgentDesktop.isElectron), hasHud: Boolean(document.getElementById('root') && document.getElementById('root').innerText.includes('开发者实时监控面板')), textLen: (document.getElementById('root')?.innerText || '').length })",
+          "({ hasRoot: Boolean(document.getElementById('root') && document.getElementById('root').innerText.includes('VoiceAgent')), hasDesktopBridge: Boolean(window.voiceAgentDesktop && window.voiceAgentDesktop.isElectron), hasWorkbenchTabs: Boolean(document.getElementById('root') && document.getElementById('root').innerText.includes('实时信号示波') && document.getElementById('root').innerText.includes('模型热插拔') && document.getElementById('root').innerText.includes('A/B 盲测实验')), textLen: (document.getElementById('root')?.innerText || '').length })",
         );
         const healthy = await isBackendHealthy();
         const report = JSON.stringify({ smoke: "ok", url: targetUrl, title, ...snapshot, backendHealthy: healthy });
         process.stdout.write(`${report}\n`);
         fs.writeFileSync(path.join(ROOT_DIR, ".electron-userdata", "smoke-result.json"), report, "utf8");
         stopBackend();
-        app.exit(snapshot.hasRoot && snapshot.hasDesktopBridge && healthy ? 0 : 1);
+        app.exit(snapshot.hasRoot && snapshot.hasDesktopBridge && snapshot.hasWorkbenchTabs && healthy ? 0 : 1);
       } catch (err) {
         process.stderr.write(`SMOKE_FAIL ${String(err)}\n`);
         stopBackend();
