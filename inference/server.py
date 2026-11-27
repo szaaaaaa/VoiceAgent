@@ -77,7 +77,7 @@ async def _run_pi_turn(req: AgentTurnRequest) -> dict[str, Any]:
     pending = _needs_explicit_approval(req)
     if pending is not None:
         return {
-            "reply": "This action may modify local files or system state. Please confirm in the approval dialog or say confirm.",
+            "reply": "该操作可能会修改本地文件或系统状态，请在弹窗中点击确认，或者直接说“确认”。",
             "tool_calls": [],
             "pending_approval": pending,
         }
@@ -89,7 +89,7 @@ async def _run_pi_turn(req: AgentTurnRequest) -> dict[str, Any]:
         not (node_exe and os.path.exists(launcher)) and not pi_exe
     ):
         return {
-            "reply": f"VoiceAgent received: {req.user_text}",
+            "reply": f"已收到你的消息：{req.user_text}",
             "tool_calls": [],
             "pending_approval": None,
         }
@@ -121,8 +121,8 @@ async def _run_pi_turn(req: AgentTurnRequest) -> dict[str, Any]:
         *(["--model", model_override] if model_override else []),
         "--append-system-prompt",
         (
-            "You are VoiceAgent, a concise spoken voice assistant. "
-            "Respond in clear natural sentences suitable for speech."
+            "你是 VoiceAgent，一个简洁自然的中文语音助手。"
+            "请始终使用清晰、口语化的中文简短回复，避免输出大段代码或 Markdown 符号，适合直接语音朗读。"
         ),
         prompt,
     ]
@@ -138,9 +138,7 @@ async def _run_pi_turn(req: AgentTurnRequest) -> dict[str, Any]:
     except TimeoutError:
         proc.kill()
         return {
-            "reply": (
-                f"Pi Agent timed out. Local voice pipeline received: {req.user_text}"
-            ),
+            "reply": f"Pi Agent 响应超时，本地语音已收到：{req.user_text}",
             "tool_calls": [],
             "pending_approval": None,
         }
@@ -148,7 +146,7 @@ async def _run_pi_turn(req: AgentTurnRequest) -> dict[str, Any]:
     reply = stdout_b.decode("utf-8", errors="replace").strip()
     if not reply:
         err = stderr_b.decode("utf-8", errors="replace").strip()
-        reply = f"Pi Agent returned no text ({err[:160]})." if err else "I did not receive a reply."
+        reply = f"Pi Agent 未返回内容（{err[:120]}）。" if err else "暂时没有收到回复。"
     return {"reply": reply, "tool_calls": [], "pending_approval": None}
 
 

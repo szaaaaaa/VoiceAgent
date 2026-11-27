@@ -62,7 +62,7 @@ export function createPiCliProvider(options: { piExecutable?: string } = {}): Ll
       "off",
       ...(toolsFlag ? ["--tools", toolsFlag] : ["--no-tools"]),
       "--append-system-prompt",
-      "You are VoiceAgent. Reply concisely in natural spoken sentences.",
+      "你是 VoiceAgent，请用简洁自然的中文口语回复，适合直接语音朗读。",
       prompt,
     ];
 

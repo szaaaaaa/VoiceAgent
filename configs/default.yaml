@@ -25,6 +25,8 @@ vad:
 asr:
   provider: "nemotron"
   model_id: "nvidia/nemotron-speech-streaming-en-0.6b"
+  fallback_hf_model: "openai/whisper-base"
+  language: "zh"
   precision: "bf16"
   chunk_size_ms: 80
   extract_encoder_features: true
@@ -41,7 +43,8 @@ turn_manager:
 
 tts:
   provider: "qwen3_tts"
-  model_id: "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+  model_id: "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
+  language: "Chinese"
   precision: "bf16"
   streaming: true
   sentence_min_chars: 12

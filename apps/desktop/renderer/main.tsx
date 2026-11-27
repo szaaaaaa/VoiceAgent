@@ -188,7 +188,14 @@ function VoiceAgentDesktop(): React.ReactElement {
     }
     window.speechSynthesis.cancel();
     const utter = new SpeechSynthesisUtterance(text);
+    utter.lang = "zh-CN";
     utter.rate = 1.05;
+    const voices = window.speechSynthesis.getVoices();
+    const zhVoice =
+      voices.find((v) => /xiaoxiao|yunxi|yaoyao|huihui/i.test(v.name) && v.lang.toLowerCase().startsWith("zh")) ??
+      voices.find((v) => v.lang.toLowerCase().startsWith("zh-cn")) ??
+      voices.find((v) => v.lang.toLowerCase().startsWith("zh"));
+    if (zhVoice) utter.voice = zhVoice;
     utter.onstart = () => {
       setAssistantState("speaking");
       if (speechEndRef.current > 0) {

@@ -115,8 +115,8 @@ class NemotronStreamingASR:
                 self._try_load_hf_whisper()
 
     def _try_load_hf_whisper(self, model_ref: str | None = None) -> None:
-        """Loads lightweight CUDA BF16 Whisper via already-installed transformers when NeMo is absent."""
-        repo: str = model_ref or os.getenv("VOICE_AGENT_HF_ASR_MODEL") or "openai/whisper-base.en"
+        """Loads multilingual CUDA BF16 Whisper (Chinese + English) when NeMo is absent."""
+        repo: str = model_ref or os.getenv("VOICE_AGENT_HF_ASR_MODEL") or "openai/whisper-base"
         try:
             from transformers import (  # type: ignore[import-untyped]
                 AutoModelForSpeechSeq2Seq,
@@ -282,7 +282,13 @@ class NemotronStreamingASR:
                     mid = hidden_states[len(hidden_states) // 2][:, -1:, :].float()
                     top = hidden_states[-1][:, -1:, :].float()
                     self._encoder_hook_outputs = [mid, top]
-            pred_ids = self._hf_asr_model.generate(input_features, max_new_tokens=64)
+            asr_lang = os.getenv("VOICE_AGENT_ASR_LANGUAGE", "zh")
+            pred_ids = self._hf_asr_model.generate(
+                input_features,
+                language=asr_lang,
+                task="transcribe",
+                max_new_tokens=64,
+            )
         decoded = self._hf_asr_processor.batch_decode(pred_ids, skip_special_tokens=True)
         return str(decoded[0]).strip() if decoded else state.last_partial
 

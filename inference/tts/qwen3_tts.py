@@ -118,10 +118,11 @@ class Qwen3StreamingTTS:
 
     def _generate_qwen3_wav(self, text: str, speaker_profile: str) -> np.ndarray:
         speaker = "Vivian" if speaker_profile == "default" else speaker_profile
+        language = os.getenv("VOICE_AGENT_TTS_LANGUAGE", "Chinese")
         with torch.inference_mode():
             if hasattr(self._model, "generate_custom_voice"):
                 wavs, sr = self._model.generate_custom_voice(
-                    text=text, language="Auto", speaker=speaker
+                    text=text, language=language, speaker=speaker
                 )
             else:
                 wavs, sr = self._model.generate(text=text)
