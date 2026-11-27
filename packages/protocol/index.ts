@@ -5,7 +5,11 @@
 
 export const BINARY_MAGIC = 0x5641; // "VA"
 export const PROTOCOL_VERSION = 1;
+export const SUPPORTED_PROTOCOL_VERSIONS = [1, 2] as const;
 export const BINARY_HEADER_BYTES = 24;
+
+export type ClientRole = "controller" | "observer";
+export type AudioMode = "local_device" | "ws_pcm";
 
 export enum StreamKind {
   MicInput = 1,
@@ -26,8 +30,11 @@ export type ProtocolEventType =
   | "session.init"
   | "session.reset"
   | "model.switch"
+  | "audio.control"
+  | "audio.level"
   | "vad.start"
   | "vad.end"
+  | "vad.state"
   | "asr.partial"
   | "asr.final"
   | "turn.prediction"
@@ -40,13 +47,20 @@ export type ProtocolEventType =
   | "tts.synthesize"
   | "tts.chunk"
   | "playback.ack"
+  | "playback.cursor"
   | "generation.cancel"
+  | "telemetry.gpu"
   | "error";
 
 export interface EventPayloadMap {
   "session.init": {
     sample_rate: number;
+    role?: ClientRole;
+    audio_mode?: AudioMode;
+    input_device?: number | string | null;
+    output_device?: number | string | null;
     turn_strategy?: string;
+    tts_engine?: string;
     asr_checkpoint?: string | null;
     tts_checkpoint?: string | null;
     adapter_checkpoint?: string | null;
@@ -55,6 +69,18 @@ export interface EventPayloadMap {
   "model.switch": {
     target: "asr" | "tts" | "turn_adapter";
     checkpoint_path: string | null;
+    checkpoint_id?: string;
+  };
+  "audio.control": {
+    action: "start_mic" | "stop_mic" | "ptt_down" | "ptt_up" | "duck" | "pause" | "resume";
+    duck_gain?: number;
+    input_device?: number | string | null;
+    output_device?: number | string | null;
+  };
+  "audio.level": {
+    mic_rms_db: number;
+    spk_rms_db: number;
+    aec_active: boolean;
   };
   "vad.start": {
     vad_prob: number;
@@ -65,6 +91,12 @@ export interface EventPayloadMap {
     vad_prob: number;
     silence_start_pts_ms: number;
     speech_duration_ms: number;
+  };
+  "vad.state": {
+    is_speech: boolean;
+    vad_prob: number;
+    pts_ms: number;
+    event: "start" | "ongoing" | "end";
   };
   "asr.partial": {
     text: string;
@@ -77,6 +109,7 @@ export interface EventPayloadMap {
     audio_start_pts_ms: number;
     audio_end_pts_ms: number;
     compute_ms: number;
+    model_id?: string;
   };
   "turn.prediction": {
     p_completion: number;
@@ -84,6 +117,8 @@ export interface EventPayloadMap {
     p_non_floor_feedback: number;
     assistant_speaking: boolean;
     adapter_version: string;
+    recommended_event?: string;
+    step_ms?: number;
   };
   "turn.commit": {
     final_transcript: string;
@@ -145,11 +180,25 @@ export interface EventPayloadMap {
     played_char_index: number;
     played_duration_ms: number;
   };
+  "playback.cursor": {
+    mode: "playing" | "ducked" | "paused" | "idle";
+    played_char_index: number;
+    played_duration_ms: number;
+    generation_id: string | null;
+    turn_id: string | null;
+  };
   "generation.cancel": {
     target_generation_id: string;
     generation_tag: number;
     reason: string;
     audible_cursor_chars: number;
+  };
+  "telemetry.gpu": {
+    device: string;
+    allocated_mb: number;
+    reserved_mb: number;
+    total_mb: number;
+    active_models: Record<string, unknown>;
   };
   error: {
     module: string;
@@ -160,8 +209,59 @@ export interface EventPayloadMap {
   };
 }
 
+export interface RegistryCheckpointEntry {
+  checkpoint_id: string;
+  model_type: "asr" | "turn_adapter" | "tts";
+  path: string | null;
+  label: string;
+  experiment_id: string;
+  metrics: Record<string, number>;
+  promoted: boolean;
+  builtin?: boolean;
+  notes?: string;
+}
+
+export interface RegistrySnapshotResponse {
+  active: Record<string, string | null>;
+  active_ids: Record<string, string>;
+  turn_strategy: string;
+  tts_engine: string;
+  checkpoints: RegistryCheckpointEntry[];
+  models: Record<string, unknown>;
+}
+
+export interface AbAsrCandidateResult {
+  checkpoint_id: string;
+  label: string;
+  transcript: string;
+  compute_ms: number;
+  rtf: number;
+  wer: number | null;
+  cer: number | null;
+}
+
+export interface AbTtsCandidateResult {
+  slot_id: string;
+  display_label: string;
+  checkpoint_id: string | null;
+  wav_base64: string;
+  sample_rate: number;
+  duration_ms: number;
+  ttfa_ms: number;
+  rtf: number;
+}
+
+export interface ExperimentReportItem {
+  id: string;
+  title: string;
+  markdown_file: string | null;
+  manifest_file: string | null;
+  markdown: string;
+  manifest: Record<string, unknown> | null;
+}
+
 export interface EventEnvelope<T extends ProtocolEventType = ProtocolEventType> {
-  v: 1;
+  v: 1 | 2;
   type: T;
   event_id: string;
   timestamp_ms: number;
@@ -198,7 +298,11 @@ export function parseEventEnvelope(raw: string): EventEnvelope {
     throw new Error("Protocol error: envelope must be a JSON object");
   }
   const obj = parsed as Record<string, unknown>;
-  if (obj.v !== PROTOCOL_VERSION || typeof obj.type !== "string" || typeof obj.session_id !== "string") {
+  if (
+    (obj.v !== 1 && obj.v !== 2) ||
+    typeof obj.type !== "string" ||
+    typeof obj.session_id !== "string"
+  ) {
     throw new Error("Protocol error: invalid version, type, or session_id");
   }
   if (typeof obj.payload !== "object" || obj.payload === null) {
@@ -241,7 +345,7 @@ export function decodeAudioFrame(buffer: ArrayBuffer | Uint8Array): BinaryAudioF
     throw new Error(`Protocol error: invalid magic 0x${magic.toString(16)}`);
   }
   const version = view.getUint8(2);
-  if (version !== PROTOCOL_VERSION) {
+  if (version !== 1 && version !== 2) {
     throw new Error(`Protocol error: unsupported version ${version}`);
   }
   const streamKind = view.getUint8(3) as StreamKind;

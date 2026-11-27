@@ -35,6 +35,7 @@ class Qwen3StreamingTTS:
         self.chunk_samples = int(sample_rate * chunk_ms / 1000)
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.checkpoint_path: str | None = None
+        self.force_fast_mode: bool = False
         self._model: Any = None
 
         if load_heavy_model or os.getenv("VOICE_AGENT_LOAD_HEAVY_MODELS") == "1":
@@ -80,7 +81,7 @@ class Qwen3StreamingTTS:
             return
         t0 = time.perf_counter()
 
-        if self._model is not None:
+        if self._model is not None and not self.force_fast_mode:
             wav = await asyncio.to_thread(self._generate_qwen3_wav, cleaned, speaker_profile)
         else:
             # shortcut: harmonic envelope PCM generator when Qwen3-TTS weights are not loaded;

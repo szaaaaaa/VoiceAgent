@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 BINARY_MAGIC = 0x5641  # "VA"
 PROTOCOL_VERSION = 1
+SUPPORTED_PROTOCOL_VERSIONS = (1, 2)
 BINARY_HEADER_BYTES = 24
 HEADER_STRUCT = struct.Struct("<HBBIdII")
 
@@ -104,7 +105,7 @@ def decode_audio_frame(raw: bytes) -> BinaryAudioFrame:
     )
     if magic != BINARY_MAGIC:
         raise ValueError(f"Invalid binary frame magic: 0x{magic:04x}")
-    if version != PROTOCOL_VERSION:
+    if version not in SUPPORTED_PROTOCOL_VERSIONS:
         raise ValueError(f"Unsupported protocol version: {version}")
     try:
         stream_kind = StreamKind(kind_val)
