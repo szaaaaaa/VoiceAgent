@@ -1,81 +1,62 @@
 # VoiceAgent
 
-**本地全双工桌面语音智能体 & 语音交互算法研发平台**
+**本地全双工语音训练推理内核 · 热插拔 Pi `/voice` 语音扩展 · 桌面算法实验观测工作台**
 
-VoiceAgent 是一个面向 **Windows 11 + NVIDIA GPU** 的桌面级实时语音助手与算法实验平台。系统以 **Pi Agent SDK** 为任务推理与工具执行核心，采用本地流式 **Nemotron ASR** 与 **Qwen3-TTS** 构建低延迟语音链路，并以可训练的 **Causal GRU Turn Adapter + 混合轮次控制器** 实现自然的全双工对话、句中停顿保持、附和恢复与实时语音打断（Barge-in）。
+VoiceAgent 是一个聚焦 **流式语音识别（ASR）微调、流式语音合成（TTS）音色适配、全双工因果轮次预测（Turn Adapter）及消费级 8 GB GPU 低延迟推理优化** 的语音算法研发与集成项目：
 
-同时，项目提供与在线推理相互解耦的离线训练与评测体系，支持 **ASR 微调、TTS 音色适配、轮次预测 Adapter 训练** 及端到端性能基准测试。
-
----
-
-## 核心特性
-
-- **自然全双工语音交互**：播放助手回复期间持续监听麦克风，精准区分**发言完成（EOT）、句中停顿（HOLD）、短暂附和（Backchannel）、主动打断（Interruption）与环境噪声（Noise）**，支持 Duck / Pause / Resume / Cancel 多级音频控制。
-- **本地流式语音模型**：默认搭载 `nvidia/nemotron-speech-streaming-en-0.6b` 流式语音识别与 `Qwen3-TTS`（0.6B）流式语音合成，语音链路全程本地运行，无需商业语音 API。
-- **Pi Agent 深度集成与安全工具调用**：直接复用 Pi SDK 的多模型接入、会话上下文与工具生态；内置 `Conversation` / `Action` 双运行模式与 `Readonly` / `Ask` / `Trusted` 三级权限网关，支持界面与语音双重授权确认。
-- **基于真实播放进度的上下文同步**：实时追踪扬声器实际已播放文本边界，被打断后精确告知 Agent“用户实际听到了哪里”，同时完整保留已执行工具的真实状态。
-- **可训练与可评测的算法平台**：内置冻结 ASR Encoder 多层特征提取、因果 GRU Turn Adapter 训练、ASR/TTS 微调流水线与覆盖 10 类系统级交互场景的评测套件，在 8 GB 消费级显存预算内稳定运行。
+1. **底层语音训练与实时推理内核（`inference/`, `training/`, `evaluation/`）**：在本地 RTX 5070 8GB 显卡上同卡运行 `Silero VAD` + 流式 `Nemotron-0.6B / Whisper` + 冻结特征驱动的 `CausalTurnGRU`（~215K 参数）+ 流式 `Qwen3-TTS-0.6B`（实测四模型峰值显存仅 **2,402.4 MB**），并提供基于 Google Drive / Hugging Face `streaming=True` 的零本地囤积微调与评测流水线。
+2. **热插拔 Pi `/voice` 语音扩展（`packages/pi-voice/`）**：不重复造 Agent Runtime 轮子，以标准 `pi-package` 形态一行命令挂载至本机二次开发的 **Pi Agent**，提供像 AGY / Codex 语音模式一样的全双工免提对话、按住说话（`Alt+V`）、实时打断（Barge-in）与真实已听播放进度上下文同步。
+3. **桌面算法实验与观测工作台（`apps/desktop/`）**：面向语音算法迭代的 Electron 实时观测与评测工具台——支持旁路实时绘制正在运行的 Pi `/voice` 会话波形、VAD 与 `CausalTurnGRU` 三头概率曲线，支持一键热插拔模型 Checkpoint、ASR/TTS 多模型 A/B 双盲 MOS 对比以及 Bad Case 录音注入回放。
 
 ---
 
-## 系统架构概览
+## 三支柱系统架构
 
 ```text
-┌──────────────────────────────────────────────────────────┐
-│              Electron + React + TypeScript GUI           │
-│       Transcript / Dual-Track State / Approvals / HUD    │
-└────────────────────────────┬─────────────────────────────┘
-                             │
-         Microphone ──► Audio Capture & 16kHz Resampler
-                             │
-                             ▼
-             AEC (with Playback Ref) & Noise Suppression
-                             │
-                             ▼
-                  Local WebSocket (127.0.0.1)
-                             │
-                             ▼
-               Silero VAD + Nemotron Streaming ASR
-                      ┌──────┴───────┐
-                      ▼              ▼
-                ASR Decoder    Causal Turn Adapter
-                      │              │
-                      └──────┬───────┘
-                             ▼
-                 Hybrid Turn Manager (TS)
-                      │              │
-         (Interrupt / Duck / Pause)  │ (Commit Turn)
-                      │              ▼
-                      │        Pi Agent SDK
-                      │       ┌──────┴──────┐
-                      │       ▼             ▼
-                      │      LLM       Agent Tools (Guarded)
-                      │       └──────┬──────┘
-                      │              ▼
-                      │   Text Filter & Sentence Buffer
-                      │              │
-                      ▼              ▼
-               Streaming Qwen3-TTS ──► Audio Playback Queue
-                                             │
-                                             └──► AEC Reference & Playback Ack
+┌────────────────────────────────────────────────────────────────────────────┐
+│            本机二次开发 Pi Agent  ◄──热插拔挂载──►  packages/pi-voice        │
+│       (/voice 开关 · Alt+V 快捷键 · 流式文本净化分句 · 播放游标打断对齐)       │
+└───────────────────────────────────────┬────────────────────────────────────┘
+                                        │ ws://127.0.0.1:8765/ws/v1/voice
+                                        ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│             Python 本地语音训练与实时推理内核 (inference / training / eval)    │
+│  • 在线全双工：WASAPI 原生音频守护 + AEC ──► Silero VAD ──► 流式 ASR          │
+│               ├──► Partial/Final 转写                                       │
+│               └──► 冻结多层 Encoder 特征 ──► CausalTurnGRU (EOT/打断/附和)    │
+│               句级可读文本 ──► 流式 Qwen3-TTS ──► 24kHz 播放队列与硬件游标     │
+│  • 离线微调：Google Drive / HF streaming=True ──► ASR LoRA & TTS 音色微调    │
+└───────────────────────────────────────▲────────────────────────────────────┘
+                                        │ Observer 旁路遥测 & REST A/B 控制
+┌───────────────────────────────────────┴────────────────────────────────────┐
+│                桌面算法实验与观测工作台 (apps/desktop · Electron)             │
+│   实时 VAD/GRU 三头概率示波器 │ Checkpoint 热切换 │ A/B 盲测台 │ BadCase 回放 │
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 技术栈速览
+## 快速开始
 
-| 层级 | 模块 | 技术选型 |
-|---|---|---|
-| **桌面与应用层** | Desktop / GUI / Runtime | Electron + React + TypeScript + Node.js |
-| **音频管线** | 采集 / 播放 / 前处理 | Web Audio API (`AudioWorklet`) + Ring/Pre-roll Buffer + WebRTC Audio Processing (AEC/NS) |
-| **语音检测与识别** | VAD / Streaming ASR | Silero VAD v5 + NVIDIA NeMo (`nvidia/nemotron-speech-streaming-en-0.6b`) |
-| **全双工轮次控制** | Turn-Taking / Barge-in | PyTorch Causal GRU Adapter + 混合轮次状态机（含 Smart Turn / 静音阈值基线） |
-| **智能体核心** | Agent Runtime & Tools | Pi Agent SDK (`@mariozechner/pi-agent-core` / `@mariozechner/pi-ai`) + 独立工具权限网关 |
-| **语音合成** | Streaming TTS | Qwen3-TTS (`Qwen/Qwen3-TTS-12Hz-0.6B`) + 句级流式缓冲 |
-| **推理与训练后端** | Local Backend / R&D | Python 3.11+ / PyTorch + CUDA / FastAPI + Local WebSocket |
-| **测试与评测** | Testing & Benchmark | Vitest (TS) + pytest (Python) + 自定义端到端评测套件 |
+### 1. 启动本地 Python 语音内核
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn inference.server:app --host 127.0.0.1 --port 8765
+```
 
-完整选型依据、版本基线与 8 GB 显存分配预算请参阅 **[技术栈选型与架构规范](docs/TECH_STACK.md)**。
+### 2. 将 `/voice` 挂载到本机二次开发 Pi Agent
+```powershell
+# 持久路径软链挂载（后续代码改动在 Pi 内执行 /reload 即可热生效）
+pi install d:/voice-agent/packages/pi-voice
+
+# 启动 Pi 并开启语音模式
+pi --voice
+```
+
+### 3. 打开桌面算法实验与观测工作台
+双击桌面 `VoiceAgent` 图标，或在仓库根目录执行：
+```powershell
+npm run build -w @voice-agent/desktop; .\node_modules\electron\dist\electron.exe apps/desktop
+```
 
 ---
 
@@ -83,58 +64,53 @@ VoiceAgent 是一个面向 **Windows 11 + NVIDIA GPU** 的桌面级实时语音�
 
 ```text
 VoiceAgent/
-├── apps/
-│   └── desktop/             # Electron 桌面端应用 (main / preload / renderer)
+├── inference/               # 本地语音推理与 WASAPI 音频守护内核 (VAD / ASR / TurnGRU / TTS)
+├── training/                # 云端流式训练与微调流水线 (ASR LoRA / Turn Adapter / TTS Speaker)
+├── evaluation/              # 模块指标评测、全双工场景回放与 GPU 性能基准套件
 ├── packages/
-│   ├── audio/               # 麦克风采集、16kHz 重采样、环形/句首缓冲、播放队列与进度追踪
-│   ├── speech/              # VAD、流式 ASR/TTS 客户端封装与句级文本切分净化
-│   ├── interaction/         # 混合轮次管理、打断控制、播放状态同步与推测式生成
-│   ├── agent/               # Pi SDK 封装、三级权限控制、授权工作流与本地工具集
-│   ├── protocol/            # Local WebSocket 消息信封、二进制帧头与共享 Schema
-│   └── metrics/             # 端到端分阶段延迟、RTF、队列水位与显存监控采集
-├── inference/               # 本地 Python 语音推理服务 (ASR / Turn Adapter / TTS / WebSocket Server)
-├── training/                # 离线训练与微调流水线 (ASR / Turn Adapter / TTS)
-├── evaluation/              # 模块级指标与 10 类系统级交互场景评测套件
-├── configs/                 # 运行时与实验 YAML 配置文件 (default.yaml)
-├── data/                    # 本地数据集、会话划分清单与评测集目录 (Git 忽略音频数据)
-├── models/                  # 本地模型缓存与 Checkpoint 注册表目录 (Git 忽略权重文件)
-├── tests/                   # 跨模块集成测试与回归测试
+│   ├── pi-voice/            # 热插拔 Pi Package 语音扩展 (/voice 命令、快捷键与宿主生命周期钩子)
+│   ├── protocol/            # WebSocket 消息信封、二进制帧编解码与三级 ID 防串台校验
+│   ├── speech/              # 语音服务客户端、可读文本净化器与自适应句级缓冲器
+│   ├── interaction/         # 混合轮次状态机、6 类交互裁决与三账本播放进度对齐
+│   ├── metrics/             # 端到端分阶段延迟、RTF 与 GPU 显存遥测采集
+│   ├── audio/               # WebAudio 采集与播放组件 (服务桌面工作台回放与试听)
+│   └── agent/               # 离线单测与工作台独立冒烟用轻量 Mock Agent 桩
+├── apps/
+│   └── desktop/             # 桌面算法实验与观测工作台 (Electron + React + TypeScript)
+├── configs/                 # 运行时与实验超参数配置
+├── models/                  # 本地模型权重缓存与 models/registry.json 注册表 (忽略大权重文件)
 └── docs/                    # 项目文档中心
-    ├── live/
-    │   └── VoiceAgent_PRD.md # 权威产品需求文档 (PRD V1.0)
-    ├── README.md             # 文档导航索引
-    ├── TECH_STACK.md         # 技术栈选型、显存与延迟预算规范
-    ├── MODULES.md            # 全模块职责边界与代码接口设计说明书
-    ├── PROTOCOL.md           # 本地 WebSocket 实时音频与事件通信协议规范
-    └── DEVELOPMENT.md        # 开发环境搭建、工程规范与分阶段实施指南
+    ├── live/                # [权威依据] V2.0 PRD 与现行全套技术/协议/实验规范
+    ├── experiments/         # RTX 5070 实测基准、Turn Adapter 消融报告与 JSON 快照
+    └── archive/v1/          # 已归档的 V1.0 独立桌面助手阶段历史文档
 ```
 
 ---
 
 ## 文档导航
 
+### 现行权威文档（`docs/live/`）
+
 | 文档 | 内容说明 |
 |---|---|
-| **[产品需求文档 (PRD V1.0)](docs/live/VoiceAgent_PRD.md)** | 产品定位、参考项目融合策略（`local-voice` + `Voice-Light`）、FR-01~FR-36 功能需求、性能指标与实验体系 |
-| **[文档中心索引](docs/README.md)** | 按研发角色（前端/系统工程、语音算法、评测验证）组织的阅读路径 |
-| **[技术栈与架构规范](docs/TECH_STACK.md)** | 分层技术选型、双进程架构决策、8 GB GPU 显存预算、端到端延迟拆解与降级策略 |
-| **[模块功能与接口设计](docs/MODULES.md)** | 9 大核心子系统的职责划分、状态机流转、TypeScript / Python 核心接口定义与异常边界 |
-| **[实时通信协议规范](docs/PROTOCOL.md)** | `127.0.0.1` WebSocket 二进制音频帧格式、三级会话 ID 隔离、15+ 核心事件定义与全双工时序图 |
-| **[开发与研发路线指南](docs/DEVELOPMENT.md)** | Windows 11 + CUDA 环境配置、Monorepo 命令、安全红线、实验记录规范与 Phase 0–5 验收标准 |
+| **[产品需求文档 (PRD V2.0)](docs/live/VoiceAgent_PRD.md)** | 三支柱重构定位、6 类全双工轮次交互、FR-01~FR-20 需求矩阵、四大微调与推理优化实验体系 |
+| **[技术栈与性能预算规范](docs/live/TECH_STACK.md)** | Python WASAPI 双模式音频决策、Win CUDA 12.8 vs WSL2/AutoDL 环境分工、RTX 5070 显存实测与 TTS 加速路线 |
+| **[模块功能与接口设计](docs/live/MODULES.md)** | `packages/pi-voice` 扩展契约、共享 TS 核心包、桌面实验工作台四大面板与 Python 训练推理接口 |
+| **[实时通信与实验协议](docs/live/PROTOCOL.md)** | `Controller + Observer` 双角色 WebSocket 协议、三级 ID 隔离、REST 模型热插拔与 A/B 盲测接口 |
+| **[开发与微调实验指南](docs/live/DEVELOPMENT_AND_EXPERIMENTS.md)** | 本地命令速查、Pi 插件软链热挂载、Google Drive / HF `streaming=True` 数据规范与 AutoDL 微调清单 |
+| **[文档中心总索引](docs/README.md)** | 按研发任务划分的阅读路径与四大架构红线速查 |
 
----
+### 实验报告与历史归档
 
-## 开发路线（Roadmap）
-
-- [ ] **Phase 0：技术验证** — 验证 Windows / WSL2 CUDA 环境、Nemotron 流式推理与中间层特征提取、Qwen3-TTS 流式合成及 8 GB 显存共存基准。
-- [ ] **Phase 1：基础语音 Agent** — 打通 Electron 桌面端、音频采集播放、本地 ASR/TTS 服务、Pi SDK 多轮对话与受权限控制的工具调用（≥20 轮连续稳定对话）。
-- [ ] **Phase 2：全双工语音交互** — 实现 AEC 回声消除、Duck/Pause/Resume/Cancel 打断控制、播放进度追踪与混合轮次决策。
-- [ ] **Phase 3：Turn Adapter 研发** — 复现 Voice-Light 因果 GRU Adapter，完成合成预训练、授权对话微调、基线对比与消融实验。
-- [ ] **Phase 4：ASR / TTS 微调** — 完成 Bad Case 归因、ASR 口音/指令微调、TTS 零样本基线对比与说话人音色微调部署。
-- [ ] **Phase 5：性能优化与发布** — 推进推测式生成（Speculative Generation）、精度量化与显存调度优化，完成 ≥4 小时稳定性压测与实验报告交付。
+- **实测实验报告（`docs/experiments/`）**：
+  - [RTX 5070 8GB 四模型同卡真实闭环实测报告](docs/experiments/rtx5070_real_models_benchmark.md)
+  - [CausalTurnGRU 轮次预测基线对比与消融实验报告](docs/experiments/turn_adapter_results.md)
+  - [本地推理管线优化前后性能基准](docs/experiments/rtx5070_perf_benchmark.md)
+- **历史归档（`docs/archive/`）**：
+  - [V1 归档说明与版本演进对照表](docs/archive/README.md)
 
 ---
 
 ## 许可证与合规声明
 
-本项目仓库源码采用 [MIT License](LICENSE) 开源。项目所引用的第三方预训练模型（如 NVIDIA Nemotron、Qwen3-TTS、Silero VAD）、外部 SDK（如 Pi Agent）及公开研究数据集各自遵循其原始许可证条款，部署与分发前请核查对应授权要求。
+本仓库源码采用 [MIT License](LICENSE) 开源。所引用的第三方预训练模型（NVIDIA Nemotron、OpenAI Whisper、Qwen3-TTS、Silero VAD）、宿主扩展接口（Pi Coding Agent）及公开研究数据集各自遵循其原始许可证条款。
