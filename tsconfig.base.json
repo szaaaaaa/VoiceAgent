@@ -23,7 +23,8 @@
       "@voice-agent/interaction": ["packages/interaction/index.ts"],
       "@voice-agent/agent": ["packages/agent/index.ts"],
       "@voice-agent/protocol": ["packages/protocol/index.ts"],
-      "@voice-agent/metrics": ["packages/metrics/index.ts"]
+      "@voice-agent/metrics": ["packages/metrics/index.ts"],
+      "@voice-agent/pi-voice": ["packages/pi-voice/src/index.ts"]
     }
   }
 }
